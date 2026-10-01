@@ -1,0 +1,258 @@
+//! AES-256-GCM codec binding each sealed secret to its store and target.
+
+use crate::hello::HelloError;
+
+use aes_gcm::Aes256Gcm;
+use aes_gcm::aead::{AeadInPlace, KeyInit, Nonce};
+use zeroize::Zeroizing;
+
+const MAGIC: [u8; 2] = [0xFF, 0xFF];
+const FORMAT_VERSION: u8 = 1;
+const VERSION_AT: usize = 2;
+const NONCE_LEN: usize = 12;
+const NONCE_AT: usize = MAGIC.len() + 1;
+const NONCE_END: usize = NONCE_AT + NONCE_LEN;
+const TAG_LEN: usize = 16;
+const MIN_BLOB_LEN: usize = NONCE_END + TAG_LEN;
+pub(crate) const PROTECTED_OVERHEAD: usize = MIN_BLOB_LEN;
+
+/// Whether `blob` carries the protected-format magic prefix.
+pub(crate) fn is_protected(blob: &[u8]) -> bool {
+    blob.starts_with(&MAGIC)
+}
+
+/// Bind length-prefixed store and target names to the ciphertext.
+fn associated_data(store: &str, target: &str) -> Result<Vec<u8>, HelloError> {
+    let mut ad = Vec::with_capacity(8 + store.len() + 8 + target.len());
+    append_name(&mut ad, store)?;
+    append_name(&mut ad, target)?;
+    Ok(ad)
+}
+
+fn append_name(ad: &mut Vec<u8>, name: &str) -> Result<(), HelloError> {
+    let bytes = name.as_bytes();
+    let len = u64::try_from(bytes.len())
+        .map_err(|_| HelloError::Platform("associated data name length exceeds u64".into()))?;
+    ad.extend_from_slice(&len.to_be_bytes());
+    ad.extend_from_slice(bytes);
+    Ok(())
+}
+
+/// Seal with a fresh nonce from the system random source.
+pub(crate) fn seal(
+    key: &[u8; 32],
+    store: &str,
+    target: &str,
+    plain: &[u8],
+) -> Result<Vec<u8>, HelloError> {
+    let mut nonce_bytes = [0u8; NONCE_LEN];
+    getrandom::fill(&mut nonce_bytes)
+        .map_err(|error| HelloError::Platform(format!("random nonce unavailable: {error}")))?;
+
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|error| HelloError::Platform(format!("sealing key setup failed: {error}")))?;
+    let nonce: &Nonce<Aes256Gcm> = nonce_bytes.as_slice().into();
+    let ad = associated_data(store, target)?;
+
+    let mut blob = Zeroizing::new(Vec::with_capacity(MIN_BLOB_LEN + plain.len()));
+    blob.extend_from_slice(&MAGIC);
+    blob.push(FORMAT_VERSION);
+    blob.extend_from_slice(&nonce_bytes);
+    blob.extend_from_slice(plain);
+
+    let plain_at = blob.len() - plain.len();
+    let tag = cipher
+        .encrypt_in_place_detached(nonce, &ad, &mut blob[plain_at..])
+        .map_err(|_| HelloError::Platform("sealing failed".into()))?;
+    blob.extend_from_slice(tag.as_slice());
+    Ok(std::mem::take(&mut *blob))
+}
+
+/// Open a protected blob into a buffer erased when dropped.
+pub(crate) fn open(
+    key: &[u8; 32],
+    store: &str,
+    target: &str,
+    blob: &[u8],
+) -> Result<Zeroizing<Vec<u8>>, HelloError> {
+    if blob.len() < MIN_BLOB_LEN {
+        return Err(HelloError::Corrupt(format!(
+            "protected blob is {len} bytes, needs at least {MIN_BLOB_LEN}",
+            len = blob.len()
+        )));
+    }
+    if !blob.starts_with(&MAGIC) {
+        return Err(HelloError::Corrupt(
+            "protected blob lacks the 0xFF 0xFF magic prefix".into(),
+        ));
+    }
+    if blob[VERSION_AT] != FORMAT_VERSION {
+        return Err(HelloError::Corrupt(format!(
+            "protected blob format version {version} is not supported",
+            version = blob[VERSION_AT]
+        )));
+    }
+
+    let nonce_slice = &blob[NONCE_AT..NONCE_END];
+    let nonce: &Nonce<Aes256Gcm> = nonce_slice.into();
+
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|error| HelloError::Platform(format!("sealing key setup failed: {error}")))?;
+    let ad = associated_data(store, target)?;
+
+    let mut buffer = Zeroizing::new(blob[NONCE_END..].to_vec());
+    cipher
+        .decrypt_in_place(nonce, &ad, &mut *buffer)
+        .map_err(|_| {
+            HelloError::Corrupt(
+                "ciphertext failed authentication against the sealing key, store, and target"
+                    .into(),
+            )
+        })?;
+    Ok(buffer)
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const STORE: &str = "myapp.store";
+    const TARGET: &str = "myapp.store/entry";
+
+    fn key() -> [u8; 32] {
+        [0x5A; 32]
+    }
+
+    fn other_key() -> [u8; 32] {
+        [0xA5; 32]
+    }
+
+    fn seal_default(plain: &[u8]) -> Vec<u8> {
+        seal(&key(), STORE, TARGET, plain).unwrap()
+    }
+
+    fn open_default(blob: &[u8]) -> Zeroizing<Vec<u8>> {
+        open(&key(), STORE, TARGET, blob).unwrap()
+    }
+
+    fn assert_corrupt(result: Result<Zeroizing<Vec<u8>>, HelloError>) {
+        match result {
+            Err(HelloError::Corrupt(_)) => {}
+            Err(_) => panic!("expected HelloError::Corrupt, got another variant"),
+            Ok(_) => panic!("expected HelloError::Corrupt, got a plaintext"),
+        }
+    }
+
+    #[test]
+    fn seal_open_roundtrip_recovers_secret() {
+        let secret = b"SENTINEL secret credential value 12345";
+        let blob = seal_default(secret);
+        assert_eq!(blob.len(), NONCE_END + secret.len() + TAG_LEN);
+        assert_eq!(&blob[..MAGIC.len()], &MAGIC);
+        assert_eq!(blob[VERSION_AT], FORMAT_VERSION);
+        assert!(is_protected(&blob));
+        assert_eq!(open_default(&blob).as_slice(), secret);
+    }
+
+    #[test]
+    fn roundtrip_recovers_empty_secret() {
+        let blob = seal_default(b"");
+        assert_eq!(blob.len(), MIN_BLOB_LEN);
+        assert!(open_default(&blob).is_empty());
+    }
+
+    #[test]
+    fn blob_contains_no_plaintext() {
+        let secret = b"SENTINEL-PLAINTEXT-SECRET";
+        let blob = seal_default(secret);
+        assert!(!blob.windows(secret.len()).any(|window| window == secret));
+    }
+
+    #[test]
+    fn seal_uses_fresh_random_nonce() {
+        let first = seal_default(b"same secret");
+        let second = seal_default(b"same secret");
+        assert_ne!(&first[NONCE_AT..NONCE_END], &second[NONCE_AT..NONCE_END]);
+        assert_ne!(&first[NONCE_END..], &second[NONCE_END..]);
+        assert_eq!(open_default(&first).as_slice(), b"same secret");
+        assert_eq!(open_default(&second).as_slice(), b"same secret");
+    }
+
+    #[test]
+    fn open_rejects_tampered_ciphertext() {
+        let mut blob = seal_default(b"tamper me");
+        blob[NONCE_END] ^= 0x01;
+        assert_corrupt(open(&key(), STORE, TARGET, &blob));
+    }
+
+    #[test]
+    fn open_rejects_tampered_tag() {
+        let mut blob = seal_default(b"tamper me");
+        let last = blob.len() - 1;
+        blob[last] ^= 0x80;
+        assert_corrupt(open(&key(), STORE, TARGET, &blob));
+    }
+
+    #[test]
+    fn open_rejects_wrong_key() {
+        let blob = seal_default(b"secret");
+        assert_corrupt(open(&other_key(), STORE, TARGET, &blob));
+    }
+
+    #[test]
+    fn open_rejects_wrong_store() {
+        let blob = seal_default(b"secret");
+        assert_corrupt(open(&key(), "other.store", TARGET, &blob));
+    }
+
+    #[test]
+    fn open_rejects_wrong_target() {
+        let blob = seal_default(b"secret");
+        assert_corrupt(open(&key(), STORE, "myapp.store/other", &blob));
+    }
+
+    #[test]
+    fn store_and_target_binding_is_unambiguous() {
+        let blob = seal(&key(), "a", "bc", b"split").unwrap();
+        assert_corrupt(open(&key(), "ab", "c", &blob));
+
+        let blob = seal(&key(), "ab", "c", b"split").unwrap();
+        assert_corrupt(open(&key(), "a", "bc", &blob));
+    }
+
+    #[test]
+    fn open_rejects_truncated_blob() {
+        let blob = seal_default(b"trim");
+        for cut in 0..MIN_BLOB_LEN {
+            assert_corrupt(open(&key(), STORE, TARGET, &blob[..cut]));
+        }
+        assert_eq!(open_default(&blob).as_slice(), b"trim");
+    }
+
+    #[test]
+    fn open_rejects_bad_magic_prefix() {
+        let mut blob = seal_default(b"prefix");
+        blob[0] = 0x00;
+        assert_corrupt(open(&key(), STORE, TARGET, &blob));
+
+        let mut blob = seal_default(b"prefix");
+        blob[1] = 0x00;
+        assert_corrupt(open(&key(), STORE, TARGET, &blob));
+    }
+
+    #[test]
+    fn open_rejects_unknown_format_version() {
+        let mut blob = seal_default(b"version");
+        blob[VERSION_AT] = FORMAT_VERSION + 1;
+        assert_corrupt(open(&key(), STORE, TARGET, &blob));
+    }
+
+    #[test]
+    fn is_protected_flags_only_protected_format() {
+        let blob = seal_default(b"anything");
+        assert!(is_protected(&blob));
+        assert!(!is_protected(b"plain legacy secret"));
+        assert!(!is_protected(&[0xFF]));
+        assert!(!is_protected(&[]));
+        assert!(!is_protected(&[0xFF, 0x00]));
+    }
+}

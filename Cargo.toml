@@ -17,10 +17,15 @@ default = ["search"]
 search = ["dep:regex"]
 
 [dependencies]
-keyring-core = { version = "1" }
+aes-gcm = "0.10"
 byteorder = "1"
+getrandom = "0.3"
+keyring-core = { version = "1" }
+libloading = "0.8"
 regex = { version = "1", optional = true }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+sha2 = "0.10"
+thiserror = "2"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Credentials", "Win32_System_Threading", "Win32_UI_WindowsAndMessaging"] }
 zeroize = "1"
 
 [dev-dependencies]

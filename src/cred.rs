@@ -9,6 +9,7 @@ use keyring_core::api::CredentialApi;
 use keyring_core::attributes::parse_attributes;
 use keyring_core::{Credential, Error as ErrorCode, Result};
 
+use crate::hello::Gate;
 pub use crate::utils::CredPersist;
 use crate::utils::{
     delete_credential, extract_attributes, extract_from_credential, extract_password,
@@ -19,11 +20,23 @@ use crate::utils::{
 /// Cred specifies or wraps a generic credential.
 /// Whether it's a specifier or wrapper depends on the specifiers field,
 /// which is a tuple <service, user> or `None`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct Cred {
     pub target_name: String,
     pub specifiers: Option<(String, String)>,
     pub persistence: CredPersist,
+    pub(crate) legacy_target: Option<String>,
+    pub(crate) hello: Option<Arc<Gate>>,
+}
+impl std::fmt::Debug for Cred {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Cred")
+            .field("target_name", &self.target_name)
+            .field("specifiers", &self.specifiers)
+            .field("persistence", &self.persistence)
+            .field("hello", &self.hello.is_some())
+            .finish()
+    }
 }
 
 impl Cred {
@@ -68,6 +81,8 @@ impl Cred {
             target_name,
             specifiers,
             persistence,
+            legacy_target: None,
+            hello: None,
         })
     }
 }
@@ -89,6 +104,16 @@ impl CredentialApi for Cred {
 
     /// See the keyring-core API docs.
     fn set_secret(&self, secret: &[u8]) -> Result<()> {
+        if let Some(gate) = &self.hello {
+            return gate.set_secret(
+                &self.target_name,
+                self.legacy_target
+                    .as_deref()
+                    .expect("gated credential has legacy target"),
+                self.specifiers.as_ref().map_or("", |(_, user)| user),
+                secret,
+            );
+        }
         validate_secret(secret)?;
         let mut username = if let Some((_, user)) = &self.specifiers {
             user.to_owned()
@@ -114,16 +139,43 @@ impl CredentialApi for Cred {
 
     /// See the keyring-core API docs.
     fn get_password(&self) -> Result<String> {
+        if self.hello.is_some() {
+            return match crate::utils::password_from_secret(self.get_secret()?) {
+                Err(ErrorCode::BadEncoding(mut secret)) => {
+                    secret.zeroize();
+                    Err(ErrorCode::BadStoreFormat(
+                        "protected secret is not valid UTF-16".into(),
+                    ))
+                }
+                result => result,
+            };
+        }
         extract_from_credential(&self.target_name, extract_password)
     }
 
     /// See the keyring-core API docs.
     fn get_secret(&self) -> Result<Vec<u8>> {
+        if let Some(gate) = &self.hello {
+            return gate.get_secret(
+                &self.target_name,
+                self.legacy_target
+                    .as_deref()
+                    .expect("gated credential has legacy target"),
+            );
+        }
         extract_from_credential(&self.target_name, extract_secret)
     }
 
     /// See the keyring-core API docs.
     fn get_attributes(&self) -> Result<HashMap<String, String>> {
+        if let Some(gate) = &self.hello {
+            return gate.attributes(
+                &self.target_name,
+                self.legacy_target
+                    .as_deref()
+                    .expect("gated credential has legacy target"),
+            );
+        }
         extract_from_credential(&self.target_name, extract_attributes)
     }
 
@@ -143,6 +195,17 @@ impl CredentialApi for Cred {
             .get("comment")
             .cloned()
             .unwrap_or_else(|| old["comment"].clone());
+        if let Some(gate) = &self.hello {
+            return gate.update_attributes(
+                &self.target_name,
+                self.legacy_target
+                    .as_deref()
+                    .expect("gated credential has legacy target"),
+                &username,
+                &target_alias,
+                &comment,
+            );
+        }
         validate_attributes(&username, &target_alias, &comment)?;
         let mut secret = self.get_secret()?;
         let result = save_credential(
@@ -160,6 +223,14 @@ impl CredentialApi for Cred {
 
     /// See the keyring-core API docs.
     fn delete_credential(&self) -> Result<()> {
+        if let Some(gate) = &self.hello {
+            return gate.delete(
+                &self.target_name,
+                self.legacy_target
+                    .as_deref()
+                    .expect("gated credential has legacy target"),
+            );
+        }
         delete_credential(&self.target_name)
     }
 
