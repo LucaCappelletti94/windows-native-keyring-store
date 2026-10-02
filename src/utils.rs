@@ -19,7 +19,6 @@ use zeroize::Zeroize;
 #[cfg(feature = "search")]
 use crate::cred::Cred;
 use crate::hello_crypto::is_protected;
-use crate::hello_mutex::lock_target;
 use keyring_core::error::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -136,7 +135,6 @@ pub fn save_credential(
     secret: &[u8],
     persistence: &CredPersist,
 ) -> Result<()> {
-    let _lock = lock_target(target_name).map_err(|err| Error::PlatformFailure(Box::new(err)))?;
     let mut username = to_wstr(user);
     let mut target_name = to_wstr(target_name);
     let mut target_alias = to_wstr(target_alias);
@@ -179,7 +177,6 @@ pub fn save_credential(
 
 /// Delete a generic credential
 pub fn delete_credential(target_name: &str) -> Result<()> {
-    let _lock = lock_target(target_name).map_err(|err| Error::PlatformFailure(Box::new(err)))?;
     let target_name = to_wstr(target_name);
     let cred_type = CRED_TYPE_GENERIC;
     match unsafe { CredDeleteW(target_name.as_ptr(), cred_type, 0) } {
@@ -272,7 +269,6 @@ pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
         target_name,
         specifiers: None,
         persistence,
-        legacy_target: None,
         hello: None,
     }
 }
@@ -355,6 +351,16 @@ pub(crate) fn target_name(credential: &CREDENTIALW) -> String {
     unsafe { from_wstr(credential.TargetName) }
 }
 
+/// Lowercase hexadecimal encoding of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    bytes
+        .iter()
+        .flat_map(|byte| [byte >> 4, byte & 15])
+        .map(|nibble| char::from(DIGITS[usize::from(nibble)]))
+        .collect()
+}
+
 /// helper for extract_from_platform
 fn erase_secret(credential: &mut CREDENTIALW) {
     let blob_pointer: *mut u8 = credential.CredentialBlob;
@@ -374,7 +380,11 @@ fn to_wstr_no_null(s: &str) -> Vec<u16> {
     s.encode_utf16().collect()
 }
 
-unsafe fn from_wstr(ws: *const u16) -> String {
+/// Reads a NUL-terminated wide string, returning an empty string for null.
+///
+/// # Safety
+/// `ws` must be null or point to a NUL-terminated UTF-16 string valid for the call.
+pub(crate) unsafe fn from_wstr(ws: *const u16) -> String {
     // null pointer case, return empty string
     if ws.is_null() {
         return String::new();

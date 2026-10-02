@@ -4,6 +4,18 @@ use keyring_core::{Error, api::CredentialStoreApi};
 
 use crate::{HelloStore, Store, hello::HelloError};
 
+fn target_of(entry: &keyring_core::Entry) -> String {
+    let cred = entry.as_any().downcast_ref::<crate::cred::Cred>();
+    cred.unwrap().target_name.clone()
+}
+
+fn legacy_entry(application: &str, user: &str) -> keyring_core::Entry {
+    Store::new()
+        .unwrap()
+        .build(application, user, None)
+        .unwrap()
+}
+
 struct ScopeCleanup {
     prefix: String,
     targets: Vec<String>,
@@ -18,12 +30,7 @@ impl ScopeCleanup {
     }
 
     fn track(&mut self, entry: &keyring_core::Entry) -> String {
-        let target = entry
-            .as_any()
-            .downcast_ref::<crate::cred::Cred>()
-            .unwrap()
-            .target_name
-            .clone();
+        let target = target_of(entry);
         self.targets.push(target.clone());
         target
     }
@@ -61,28 +68,12 @@ fn named_store_scopes_targets_and_rejects_enterprise_persistence() {
     let second = HelloStore::new("a", "naccount").unwrap();
     let first_entry = first.build("svc", "user", None).unwrap();
     let second_entry = second.build("svc", "user", None).unwrap();
-    let first_target = &first_entry
-        .as_any()
-        .downcast_ref::<crate::cred::Cred>()
-        .unwrap()
-        .target_name;
-    let second_target = &second_entry
-        .as_any()
-        .downcast_ref::<crate::cred::Cred>()
-        .unwrap()
-        .target_name;
-    assert_ne!(first_target, second_target);
+    let first_target = target_of(&first_entry);
+    assert_ne!(first_target, target_of(&second_entry));
     let reopened = HelloStore::new("an", "account").unwrap();
     assert_eq!(first.id(), reopened.id());
     let reopened_entry = reopened.build("svc", "user", None).unwrap();
-    assert_eq!(
-        first_target,
-        &reopened_entry
-            .as_any()
-            .downcast_ref::<crate::cred::Cred>()
-            .unwrap()
-            .target_name
-    );
+    assert_eq!(first_target, target_of(&reopened_entry));
     assert!(matches!(
         first.build(
             "svc",
@@ -124,8 +115,7 @@ fn unlock_without_live_owner_fails_before_authentication() {
 fn migration_seals_exact_legacy_secret_before_returning_it() {
     let application = format!("test-{}", fastrand::u64(..));
     let user = format!("user-{}", fastrand::u64(..));
-    let ordinary = Store::new().unwrap();
-    let legacy = ordinary.build(&application, &user, None).unwrap();
+    let legacy = legacy_entry(&application, &user);
     legacy.set_password("refresh-token").unwrap();
 
     let protected_store = HelloStore::new(&application, "shared").unwrap();
@@ -134,13 +124,9 @@ fn migration_seals_exact_legacy_secret_before_returning_it() {
     assert_eq!(protected.get_password().unwrap(), "refresh-token");
     assert!(matches!(legacy.get_password(), Err(Error::NoEntry)));
 
-    let target = &protected
-        .as_any()
-        .downcast_ref::<crate::cred::Cred>()
-        .unwrap()
-        .target_name;
     let stored =
-        crate::utils::extract_from_credential(target, crate::utils::extract_secret).unwrap();
+        crate::utils::extract_from_credential(&target_of(&protected), crate::utils::extract_secret)
+            .unwrap();
     assert!(crate::hello_crypto::is_protected(&stored));
     assert_ne!(stored, b"refresh-token");
     protected_store.lock();
@@ -156,17 +142,9 @@ fn migration_seals_exact_legacy_secret_before_returning_it() {
 fn failed_migration_preserves_the_original_credential() {
     let application = format!("test-{}", fastrand::u64(..));
     let user = format!("user-{}", fastrand::u64(..));
-    let legacy = Store::new()
-        .unwrap()
-        .build(&application, &user, None)
-        .unwrap();
-    let original = vec![
-        42;
-        usize::try_from(
-            windows_sys::Win32::Security::Credentials::CRED_MAX_CREDENTIAL_BLOB_SIZE
-        )
-        .unwrap()
-    ];
+    let legacy = legacy_entry(&application, &user);
+    let original =
+        vec![42; windows_sys::Win32::Security::Credentials::CRED_MAX_CREDENTIAL_BLOB_SIZE as usize];
     legacy.set_secret(&original).unwrap();
 
     let protected_store = HelloStore::new(&application, "shared").unwrap();
@@ -174,13 +152,8 @@ fn failed_migration_preserves_the_original_credential() {
     protected_store.install_test_key([27; 32]);
     assert!(matches!(protected.get_secret(), Err(Error::TooLong(_, _))));
     assert_eq!(legacy.get_secret().unwrap(), original);
-    let target = &protected
-        .as_any()
-        .downcast_ref::<crate::cred::Cred>()
-        .unwrap()
-        .target_name;
     assert!(matches!(
-        crate::utils::extract_from_credential(target, crate::utils::extract_secret),
+        crate::utils::extract_from_credential(&target_of(&protected), crate::utils::extract_secret),
         Err(Error::NoEntry)
     ));
     legacy.delete_credential().unwrap();
@@ -198,10 +171,7 @@ fn locked_delete_removes_both_exact_sources_without_decrypting() {
     protected.set_secret(b"sealed").unwrap();
     store.lock();
 
-    let legacy = Store::new()
-        .unwrap()
-        .build(&application, &user, None)
-        .unwrap();
+    let legacy = legacy_entry(&application, &user);
     cleanup.track(&legacy);
     legacy.set_secret(b"independent").unwrap();
     protected.delete_credential().unwrap();
@@ -216,10 +186,7 @@ fn locked_delete_removes_both_exact_sources_without_decrypting() {
 fn deleting_a_legacy_entry_never_exposes_a_plaintext_source_afterwards() {
     let application = format!("test-{}", fastrand::u64(..));
     let user = format!("user-{}", fastrand::u64(..));
-    let legacy = Store::new()
-        .unwrap()
-        .build(&application, &user, None)
-        .unwrap();
+    let legacy = legacy_entry(&application, &user);
     legacy.set_secret(b"legacy").unwrap();
 
     let store = HelloStore::new(&application, "shared").unwrap();
@@ -253,11 +220,7 @@ fn tampered_scoped_ciphertext_never_returns_plaintext() {
     let entry = store.build(&application, "credential", None).unwrap();
     entry.set_secret(b"sealed-token").unwrap();
 
-    let target = &entry
-        .as_any()
-        .downcast_ref::<crate::cred::Cred>()
-        .unwrap()
-        .target_name;
+    let target = &target_of(&entry);
     let ordinary = Store::new()
         .unwrap()
         .build(
@@ -303,10 +266,7 @@ fn dropping_the_store_locks_retained_entries() {
 fn migration_accepts_arbitrary_legacy_binary_secret() {
     let application = format!("test-{}", fastrand::u64(..));
     let user = format!("binary-{}", fastrand::u64(..));
-    let ordinary = Store::new()
-        .unwrap()
-        .build(&application, &user, None)
-        .unwrap();
+    let ordinary = legacy_entry(&application, &user);
     let secret = [0xFF, 0xFF, 0x01, 0x02, 0x00];
     ordinary.set_secret(&secret).unwrap();
 
@@ -326,7 +286,6 @@ fn migration_accepts_arbitrary_legacy_binary_secret() {
 fn locked_delete_of_absent_entry_returns_no_entry() {
     let application = format!("delete-{}", fastrand::u64(..));
     let store = HelloStore::new(&application, "shared").unwrap();
-    let _cleanup = ScopeCleanup::new(&store);
     let entry = store.build(&application, "absent", None).unwrap();
     assert!(matches!(entry.delete_credential(), Err(Error::NoEntry)));
 }

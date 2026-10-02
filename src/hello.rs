@@ -11,14 +11,14 @@ use windows_sys::Win32::Security::Credentials::{
     CRED_MAX_CREDENTIAL_BLOB_SIZE, CREDENTIALW, CredEnumerateW, CredFree,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::hello_crypto::{PROTECTED_OVERHEAD, is_protected, open, seal};
 use crate::hello_mutex::{lock_target, lock_target_with_timeout};
 use crate::hello_native;
 use crate::utils::{
     CredPersist, delete_credential, extract_attributes, extract_from_credential, extract_secret,
-    save_credential, validate_secret, validate_target,
+    hex, save_credential, validate_secret, validate_target,
 };
 
 pub use crate::hello_native::{HelloCancellation, HelloWindow};
@@ -64,6 +64,13 @@ impl From<HelloError> for Error {
     }
 }
 
+pub(crate) type HelloResult<T> = std::result::Result<T, HelloError>;
+
+/// Recovers a poisoned guard, since no gate invariant depends on a panicking holder.
+pub(crate) fn unpoison<T>(result: std::sync::LockResult<T>) -> T {
+    result.unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Protection {
     Locked,
@@ -72,18 +79,14 @@ pub enum Protection {
 }
 
 struct Request {
-    id: u64,
     cancellation: HelloCancellation,
-    completed: Mutex<Option<std::result::Result<(), HelloError>>>,
+    completed: Mutex<Option<HelloResult<()>>>,
     changed: Condvar,
 }
 
 impl Request {
-    fn finish(&self, result: std::result::Result<(), HelloError>) {
-        let mut completed = self
-            .completed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn finish(&self, result: HelloResult<()>) {
+        let mut completed = unpoison(self.completed.lock());
         *completed = Some(result);
         self.changed.notify_all();
     }
@@ -93,14 +96,11 @@ impl Request {
         timeout: Duration,
         caller: &HelloCancellation,
         owns_operation: bool,
-    ) -> std::result::Result<(), HelloError> {
+    ) -> HelloResult<()> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(HelloError::TimedOut)?;
-        let mut completed = self
-            .completed
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut completed = unpoison(self.completed.lock());
         loop {
             if caller.is_cancelled() {
                 return Err(HelloError::Cancelled);
@@ -115,20 +115,59 @@ impl Request {
                 }
                 return Err(HelloError::TimedOut);
             }
-            let (next, _) = self
-                .changed
-                .wait_timeout(completed, remaining.min(Duration::from_millis(50)))
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (next, _) = unpoison(
+                self.changed
+                    .wait_timeout(completed, remaining.min(Duration::from_millis(50))),
+            );
             completed = next;
         }
     }
 }
 
 struct State {
-    generation: u64,
     key: Option<Zeroizing<[u8; 32]>>,
     active: Option<Arc<Request>>,
     lost: bool,
+}
+
+impl State {
+    /// Erases the key and cancels the pending request under the state lock, so it cannot publish.
+    fn revoke(&mut self) -> Option<Arc<Request>> {
+        self.key = None;
+        let request = self.active.clone()?;
+        request.cancellation.mark_cancelled();
+        Some(request)
+    }
+
+    /// Publishes a finished request's outcome unless it was cancelled first.
+    fn settle(
+        &mut self,
+        request: &Arc<Request>,
+        result: HelloResult<Zeroizing<[u8; 32]>>,
+    ) -> HelloResult<()> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| Arc::ptr_eq(active, request))
+        {
+            self.active = None;
+        }
+        if request.cancellation.is_cancelled() {
+            return Err(HelloError::Cancelled);
+        }
+        match result {
+            Ok(key) => {
+                self.key = Some(key);
+                Ok(())
+            }
+            Err(error) => {
+                if matches!(error, HelloError::KeyLost | HelloError::Corrupt(_)) {
+                    self.lost = true;
+                }
+                Err(error)
+            }
+        }
+    }
 }
 
 pub(crate) struct Gate {
@@ -172,10 +211,7 @@ impl Gate {
         }
         let mut prefix = "keyring:hello-prf:1:".to_owned();
         for identifier in [application, store] {
-            use std::fmt::Write;
-            write!(prefix, "{:x}:", identifier.len()).expect("string formatting");
-            append_hex(&mut prefix, identifier.as_bytes());
-            prefix.push(':');
+            prefix += &format!("{:x}:{}:", identifier.len(), hex(identifier.as_bytes()));
         }
         validate_target(&format!("{prefix}metadata"), "")?;
         let generation = match read_control(&format!("{prefix}control")) {
@@ -185,17 +221,12 @@ impl Gate {
             Err(error) => return Err(error.into()),
         };
         let digest = Sha256::digest(prefix.as_bytes());
-        let mut rp_id = String::with_capacity(64 + 1 + ".invalid".len());
-        append_hex(&mut rp_id, &digest[..16]);
-        rp_id.push('.');
-        append_hex(&mut rp_id, &digest[16..]);
-        rp_id.push_str(".invalid");
+        let rp_id = format!("{}.{}.invalid", hex(&digest[..16]), hex(&digest[16..]));
         Ok(Arc::new(Self {
             prefix,
             rp_id,
             generation,
             state: Mutex::new(State {
-                generation: 0,
                 key: None,
                 active: None,
                 lost: false,
@@ -205,10 +236,7 @@ impl Gate {
 
     #[cfg(test)]
     pub(crate) fn install_test_key(&self, key: [u8; 32]) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .key = Some(Zeroizing::new(key));
+        unpoison(self.state.lock()).key = Some(Zeroizing::new(key));
     }
 
     pub(crate) fn id(&self) -> String {
@@ -216,10 +244,7 @@ impl Gate {
     }
 
     pub(crate) fn protection(&self) -> Protection {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = unpoison(self.state.lock());
         if state.lost {
             Protection::Lost
         } else if state.key.is_some() {
@@ -230,17 +255,17 @@ impl Gate {
     }
 
     pub(crate) fn scoped_target(&self, legacy: &str) -> Result<String> {
-        let mut target =
-            String::with_capacity(self.prefix.len() + 6 + legacy.len().saturating_mul(2));
-        target.push_str(&self.prefix);
-        target.push_str("entry:");
-        append_hex(&mut target, legacy.as_bytes());
+        let target = format!("{}entry:{}", self.prefix, hex(legacy.as_bytes()));
         validate_target(&target, "")?;
         Ok(target)
     }
 
-    pub(crate) fn capability() -> std::result::Result<(), HelloError> {
-        hello_native::available()
+    fn legacy_target(&self, target: &str) -> Result<String> {
+        let encoded = target
+            .strip_prefix(&self.prefix)
+            .and_then(|suffix| suffix.strip_prefix("entry:"))
+            .ok_or_else(|| Error::BadStoreFormat("entry escaped its scoped prefix".into()))?;
+        Ok(decode_hex(encoded)?)
     }
 
     pub(crate) fn unlock(
@@ -248,8 +273,10 @@ impl Gate {
         owner: Arc<dyn HelloWindow>,
         cancellation: &HelloCancellation,
         timeout: Duration,
-    ) -> std::result::Result<(), HelloError> {
-        if owner.hwnd().is_null() || unsafe { IsWindow(owner.hwnd()) } == 0 {
+    ) -> HelloResult<()> {
+        // Refuse before metadata is touched, ahead of the native check at the prompt.
+        // SAFETY: `IsWindow` accepts any handle value, including null or stale handles.
+        if unsafe { IsWindow(owner.hwnd()) } == 0 {
             return Err(HelloError::MissingOwner);
         }
         let timeout = timeout.min(MAX_WAIT);
@@ -266,23 +293,16 @@ impl Gate {
         cancellation: &HelloCancellation,
         timeout: Duration,
         work: F,
-    ) -> std::result::Result<(), HelloError>
+    ) -> HelloResult<()>
     where
-        F: FnOnce(
-                &Gate,
-                &HelloCancellation,
-                Duration,
-            ) -> std::result::Result<Zeroizing<[u8; 32]>, HelloError>
+        F: FnOnce(&Gate, &HelloCancellation, Duration) -> HelloResult<Zeroizing<[u8; 32]>>
             + Send
             + 'static,
     {
         if cancellation.is_cancelled() {
             return Err(HelloError::Cancelled);
         }
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut state = unpoison(self.state.lock());
         if state.lost {
             return Err(HelloError::KeyLost);
         }
@@ -290,7 +310,7 @@ impl Gate {
             return Ok(());
         }
         let request = match &state.active {
-            Some(request) if request.id != state.generation => {
+            Some(request) if request.cancellation.is_cancelled() => {
                 let request = Arc::clone(request);
                 drop(state);
                 request.wait(timeout, cancellation, false)?;
@@ -298,9 +318,7 @@ impl Gate {
             }
             Some(request) => (Arc::clone(request), false),
             None => {
-                state.generation = state.generation.wrapping_add(1);
                 let request = Arc::new(Request {
-                    id: state.generation,
                     cancellation: cancellation.clone(),
                     completed: Mutex::new(None),
                     changed: Condvar::new(),
@@ -310,36 +328,7 @@ impl Gate {
                 let worker_request = Arc::clone(&request);
                 std::thread::spawn(move || {
                     let result = work(&gate, &worker_request.cancellation, timeout);
-                    let mut state = gate
-                        .state
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let outcome = if state.generation != worker_request.id
-                        || worker_request.cancellation.is_cancelled()
-                    {
-                        Err(HelloError::Cancelled)
-                    } else {
-                        match result {
-                            Ok(key) => {
-                                state.key = Some(key);
-                                Ok(())
-                            }
-                            Err(error) => {
-                                if matches!(error, HelloError::KeyLost | HelloError::Corrupt(_)) {
-                                    state.lost = true;
-                                }
-                                Err(error)
-                            }
-                        }
-                    };
-                    if state
-                        .active
-                        .as_ref()
-                        .is_some_and(|request| request.id == worker_request.id)
-                    {
-                        state.active = None;
-                    }
-                    drop(state);
+                    let outcome = unpoison(gate.state.lock()).settle(&worker_request, result);
                     worker_request.finish(outcome);
                 });
                 (request, true)
@@ -350,16 +339,9 @@ impl Gate {
     }
 
     pub(crate) fn lock(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.generation = state.generation.wrapping_add(1);
-        state.key = None;
-        let request = state.active.as_ref().map(Arc::clone);
-        drop(state);
+        let request = unpoison(self.state.lock()).revoke();
         if let Some(request) = request {
-            request.cancellation.cancel();
+            request.cancellation.abort_native();
         }
     }
 
@@ -368,7 +350,7 @@ impl Gate {
         owner: Arc<dyn HelloWindow>,
         cancellation: &HelloCancellation,
         timeout: Duration,
-    ) -> std::result::Result<Zeroizing<[u8; 32]>, HelloError> {
+    ) -> HelloResult<Zeroizing<[u8; 32]>> {
         let metadata_target = self.metadata_target();
         // Discard waits on this lease before removing enrollment state.
         let _lease = lock_target(&metadata_target)?;
@@ -384,53 +366,37 @@ impl Gate {
         owner: Arc<dyn HelloWindow>,
         cancellation: &HelloCancellation,
         timeout: Duration,
-    ) -> std::result::Result<Zeroizing<[u8; 32]>, HelloError> {
-        let metadata = match read_raw(metadata_target)? {
-            Some(bytes) => Some(parse_metadata(&bytes)?),
-            None => None,
-        };
-        match metadata {
-            Some(mut metadata) => {
-                if metadata.credential_id.is_none() {
-                    if self.has_scoped_entries()? {
-                        return Err(HelloError::KeyLost);
-                    }
-                    metadata.credential_id =
-                        hello_native::recover_created(&self.rp_id, &metadata.user_id)?;
-                    if let Some(ref id) = metadata.credential_id {
-                        save_metadata(metadata_target, &metadata)?;
-                        return hello_native::assert_prf(
-                            owner,
-                            &self.rp_id,
-                            id,
-                            &metadata.salt,
-                            cancellation,
-                            timeout,
-                        );
-                    }
-                    delete_credential(metadata_target).map_err(platform)?;
-                } else {
-                    let id = metadata
-                        .credential_id
-                        .as_deref()
-                        .ok_or(HelloError::KeyLost)?;
-                    return hello_native::assert_prf(
-                        owner,
-                        &self.rp_id,
-                        id,
-                        &metadata.salt,
-                        cancellation,
-                        timeout,
-                    );
+    ) -> HelloResult<Zeroizing<[u8; 32]>> {
+        if let Some(bytes) = read_raw(metadata_target)? {
+            let mut metadata = parse_metadata(&bytes)?;
+            if metadata.credential_id.is_none() {
+                if self.has_scoped_entries()? {
+                    return Err(HelloError::KeyLost);
+                }
+                metadata.credential_id =
+                    hello_native::recover_created(&self.rp_id, &metadata.user_id)?;
+                match metadata.credential_id {
+                    Some(_) => save_metadata(metadata_target, &metadata)?,
+                    None => delete_credential(metadata_target).map_err(platform)?,
                 }
             }
-            None if self.has_scoped_entries()? => return Err(HelloError::KeyLost),
-            None => (),
+            if let Some(id) = &metadata.credential_id {
+                return hello_native::assert_prf(
+                    owner,
+                    &self.rp_id,
+                    id,
+                    &metadata.salt,
+                    cancellation,
+                    timeout,
+                );
+            }
+        } else if self.has_scoped_entries()? {
+            return Err(HelloError::KeyLost);
         }
         let mut user_id = [0u8; 32];
         let mut salt = [0u8; 32];
-        getrandom::fill(&mut user_id).map_err(|err| HelloError::Platform(err.to_string()))?;
-        getrandom::fill(&mut salt).map_err(|err| HelloError::Platform(err.to_string()))?;
+        getrandom::fill(&mut user_id).map_err(platform)?;
+        getrandom::fill(&mut salt).map_err(platform)?;
         let pending = Metadata {
             salt,
             user_id,
@@ -455,7 +421,7 @@ impl Gate {
         Ok(created.key)
     }
 
-    fn scoped_targets(&self) -> std::result::Result<Vec<String>, HelloError> {
+    fn scoped_targets(&self) -> HelloResult<Vec<String>> {
         let entry_prefix = format!("{}entry:", self.prefix);
         let filter: Vec<u16> = format!("{entry_prefix}*\0").encode_utf16().collect();
         let mut count = 0;
@@ -492,7 +458,7 @@ impl Gate {
         Ok(targets)
     }
 
-    fn has_scoped_entries(&self) -> std::result::Result<bool, HelloError> {
+    fn has_scoped_entries(&self) -> HelloResult<bool> {
         Ok(!self.scoped_targets()?.is_empty())
     }
 
@@ -512,15 +478,8 @@ impl Gate {
             regex::Regex::new(&spec).map_err(|error| Error::BadStoreFormat(error.to_string()))?;
         self.guarded(|| {
             let mut result = Vec::new();
-            for target_name in self.scoped_targets().map_err(Error::from)? {
-                let suffix = target_name
-                    .strip_prefix(&self.prefix)
-                    .and_then(|suffix| suffix.strip_prefix("entry:"))
-                    .ok_or_else(|| {
-                        Error::BadStoreFormat("entry escaped its scoped prefix".into())
-                    })?;
-                let legacy =
-                    decode_hex(suffix).map_err(|error| Error::BadStoreFormat(error.to_string()))?;
+            for target_name in self.scoped_targets()? {
+                let legacy = self.legacy_target(&target_name)?;
                 if pattern.is_some_and(|pattern| !pattern.is_match(&legacy)) {
                     continue;
                 }
@@ -531,7 +490,6 @@ impl Gate {
                     target_name,
                     specifiers,
                     persistence: CredPersist::Local,
-                    legacy_target: Some(legacy),
                     hello: Some(Arc::clone(self)),
                 })));
             }
@@ -547,7 +505,7 @@ impl Gate {
         format!("{}control", self.prefix)
     }
 
-    fn check_control(&self) -> std::result::Result<(), HelloError> {
+    fn check_control(&self) -> HelloResult<()> {
         let control = match read_control(&self.control_target()) {
             Ok(control) => control,
             Err(HelloError::Corrupt(_)) => return Err(HelloError::Discarding),
@@ -563,17 +521,14 @@ impl Gate {
 
     // Discard writes its marker under the same lock, so a passed check holds for `action`.
     fn guarded<T>(&self, action: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _store = lock_target(&self.control_target()).map_err(Error::from)?;
-        self.check_control().map_err(Error::from)?;
+        let _store = lock_target(&self.control_target())?;
+        self.check_control()?;
         action()
     }
 
     fn with_key<T>(&self, action: impl FnOnce(&[u8; 32]) -> Result<T>) -> Result<T> {
         self.guarded(|| {
-            let state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = unpoison(self.state.lock());
             let key = state.key.as_ref().ok_or_else(|| {
                 Error::from(if state.lost {
                     HelloError::KeyLost
@@ -585,41 +540,16 @@ impl Gate {
         })
     }
 
-    pub(crate) fn get_secret(&self, target: &str, legacy: &str) -> Result<Vec<u8>> {
-        self.with_key(|key| {
-            let blob = match read_raw(target).map_err(Error::from)? {
-                Some(blob) => blob,
-                None => return self.migrate(target, legacy, key),
-            };
-            if !is_protected(&blob) {
-                return Err(HelloError::Corrupt("scoped secret is unsealed".into()).into());
-            }
-            let mut secret = open(key, &self.prefix, target, &blob).map_err(Error::from)?;
-            Ok(std::mem::take(&mut *secret))
-        })
+    pub(crate) fn get_secret(&self, target: &str) -> Result<Vec<u8>> {
+        self.with_key(|key| Ok(std::mem::take(&mut *self.migrate(target, key)?)))
     }
 
-    pub(crate) fn set_secret(
-        &self,
-        target: &str,
-        legacy: &str,
-        user: &str,
-        secret: &[u8],
-    ) -> Result<()> {
+    pub(crate) fn set_secret(&self, target: &str, user: &str, secret: &[u8]) -> Result<()> {
         validate_protected_plaintext(secret)?;
         self.with_key(|key| {
-            match read_raw(target).map_err(Error::from)? {
-                Some(blob) => {
-                    if !is_protected(&blob) {
-                        return Err(HelloError::Corrupt("scoped secret is unsealed".into()).into());
-                    }
-                    open(key, &self.prefix, target, &blob).map_err(Error::from)?;
-                }
-                None => match self.migrate(target, legacy, key) {
-                    Ok(mut original) => original.zeroize(),
-                    Err(Error::NoEntry) => (),
-                    Err(error) => return Err(error),
-                },
+            match self.migrate(target, key) {
+                Ok(_) | Err(Error::NoEntry) => (),
+                Err(error) => return Err(error),
             }
             let attributes = match extract_from_credential(target, extract_attributes) {
                 Ok(attributes) => Some(attributes),
@@ -635,7 +565,7 @@ impl Gate {
             let comment = attributes
                 .as_ref()
                 .map_or("", |attrs| attrs["comment"].as_str());
-            let sealed = seal(key, &self.prefix, target, secret).map_err(Error::from)?;
+            let sealed = seal(key, &self.prefix, target, secret)?;
             validate_secret(&sealed)?;
             save_credential(
                 target,
@@ -651,53 +581,33 @@ impl Gate {
     pub(crate) fn update_attributes(
         &self,
         target: &str,
-        legacy: &str,
         user: &str,
         alias: &str,
         comment: &str,
     ) -> Result<()> {
         crate::utils::validate_attributes(user, alias, comment)?;
         self.with_key(|key| {
-            if read_raw(target).map_err(Error::from)?.is_none() {
-                let mut migrated = self.migrate(target, legacy, key)?;
-                migrated.zeroize();
-            }
-            let blob = read_raw(target)
-                .map_err(Error::from)?
-                .ok_or(Error::NoEntry)?;
-            if !is_protected(&blob) {
-                return Err(HelloError::Corrupt("scoped secret is unsealed".into()).into());
-            }
-            open(key, &self.prefix, target, &blob).map_err(Error::from)?;
-            save_credential(target, user, alias, comment, &blob, &CredPersist::Local)
+            let secret = self.migrate(target, key)?;
+            let sealed = seal(key, &self.prefix, target, &secret)?;
+            save_credential(target, user, alias, comment, &sealed, &CredPersist::Local)
         })
     }
 
     pub(crate) fn attributes(
         &self,
         target: &str,
-        legacy: &str,
     ) -> Result<std::collections::HashMap<String, String>> {
         self.with_key(|key| {
-            if read_raw(target).map_err(Error::from)?.is_none() {
-                let mut migrated = self.migrate(target, legacy, key)?;
-                migrated.zeroize();
-            }
-            let blob = read_raw(target)
-                .map_err(Error::from)?
-                .ok_or(Error::NoEntry)?;
-            if !is_protected(&blob) {
-                return Err(HelloError::Corrupt("scoped secret is unsealed".into()).into());
-            }
-            open(key, &self.prefix, target, &blob).map_err(Error::from)?;
+            self.migrate(target, key)?;
             extract_from_credential(target, extract_attributes)
         })
     }
 
-    pub(crate) fn delete(&self, target: &str, legacy: &str) -> Result<()> {
+    pub(crate) fn delete(&self, target: &str) -> Result<()> {
+        let legacy = &self.legacy_target(target)?;
         self.guarded(|| {
-            let _source_lock = lock_target(legacy).map_err(Error::from)?;
-            let _destination_lock = lock_target(target).map_err(Error::from)?;
+            // Stores sharing a service and user also share this legacy source.
+            let _source_lock = lock_target(legacy)?;
             let legacy_deleted = match delete_credential(legacy) {
                 Ok(()) => true,
                 Err(Error::NoEntry) => false,
@@ -713,7 +623,7 @@ impl Gate {
         })
     }
 
-    pub(crate) fn discard(&self, timeout: Duration) -> std::result::Result<(), HelloError> {
+    pub(crate) fn discard(&self, timeout: Duration) -> HelloResult<()> {
         let deadline = Instant::now()
             .checked_add(timeout)
             .ok_or(HelloError::TimedOut)?;
@@ -768,10 +678,7 @@ impl Gate {
         )
     }
 
-    fn remove_enrollment_credential(
-        &self,
-        metadata_target: &str,
-    ) -> std::result::Result<(), HelloError> {
+    fn remove_enrollment_credential(&self, metadata_target: &str) -> HelloResult<()> {
         let Some(bytes) = read_raw(metadata_target)? else {
             return hello_native::remove_all_for_rp(&self.rp_id);
         };
@@ -791,23 +698,23 @@ impl Gate {
         }
     }
 
-    fn migrate(&self, target: &str, legacy: &str, key: &[u8; 32]) -> Result<Vec<u8>> {
-        let _source_lock = lock_target(legacy).map_err(Error::from)?;
-        let _destination_lock = lock_target(target).map_err(Error::from)?;
-        if let Some(blob) = read_raw(target).map_err(Error::from)? {
+    /// Opens the scoped secret, first sealing and moving its exact legacy source if absent.
+    fn migrate(&self, target: &str, key: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
+        let legacy = &self.legacy_target(target)?;
+        let _source_lock = lock_target(legacy)?;
+        if let Some(blob) = read_raw(target)? {
             if !is_protected(&blob) {
                 return Err(HelloError::Corrupt("scoped secret is unsealed".into()).into());
             }
-            let mut plain = open(key, &self.prefix, target, &blob).map_err(Error::from)?;
-            return Ok(std::mem::take(&mut *plain));
+            return Ok(open(key, &self.prefix, target, &blob)?);
         }
         let Snapshot {
-            mut source,
+            source,
             attributes,
             modified,
         } = snapshot(legacy)?;
         validate_protected_plaintext(&source)?;
-        let sealed = seal(key, &self.prefix, target, &source).map_err(Error::from)?;
+        let sealed = seal(key, &self.prefix, target, &source)?;
         validate_secret(&sealed)?;
         save_credential(
             target,
@@ -832,7 +739,7 @@ impl Gate {
             Err(Error::NoEntry) => return Err(HelloError::Conflict(legacy.into()).into()),
             result => result?,
         }
-        Ok(std::mem::take(&mut *source))
+        Ok(source)
     }
 }
 
@@ -848,7 +755,7 @@ fn snapshot(target: &str) -> Result<Snapshot> {
     })
 }
 
-fn read_raw(target: &str) -> std::result::Result<Option<Zeroizing<Vec<u8>>>, HelloError> {
+fn read_raw(target: &str) -> HelloResult<Option<Zeroizing<Vec<u8>>>> {
     match extract_from_credential(target, extract_secret) {
         Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
         Err(Error::NoEntry) => Ok(None),
@@ -856,7 +763,7 @@ fn read_raw(target: &str) -> std::result::Result<Option<Zeroizing<Vec<u8>>>, Hel
     }
 }
 
-fn platform(error: Error) -> HelloError {
+fn platform(error: impl std::fmt::Display) -> HelloError {
     HelloError::Platform(error.to_string())
 }
 
@@ -870,7 +777,7 @@ fn validate_protected_plaintext(secret: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn parse_metadata(blob: &[u8]) -> std::result::Result<Metadata, HelloError> {
+fn parse_metadata(blob: &[u8]) -> HelloResult<Metadata> {
     if blob.len() < 70 || &blob[..5] != META_MAGIC {
         return Err(HelloError::Corrupt("invalid enrollment record".into()));
     }
@@ -898,7 +805,7 @@ fn parse_metadata(blob: &[u8]) -> std::result::Result<Metadata, HelloError> {
     })
 }
 
-fn save_metadata(target: &str, metadata: &Metadata) -> std::result::Result<(), HelloError> {
+fn save_metadata(target: &str, metadata: &Metadata) -> HelloResult<()> {
     let mut bytes = Vec::with_capacity(72 + metadata.credential_id.as_ref().map_or(0, Vec::len));
     bytes.extend_from_slice(META_MAGIC);
     bytes.push(u8::from(metadata.credential_id.is_some()));
@@ -916,7 +823,7 @@ fn save_metadata(target: &str, metadata: &Metadata) -> std::result::Result<(), H
     save_credential(target, "", "", "", &bytes, &CredPersist::Local).map_err(platform)
 }
 
-fn read_control(target: &str) -> std::result::Result<Option<Control>, HelloError> {
+fn read_control(target: &str) -> HelloResult<Option<Control>> {
     let Some(blob) = read_raw(target)? else {
         return Ok(None);
     };
@@ -937,7 +844,7 @@ fn read_control(target: &str) -> std::result::Result<Option<Control>, HelloError
     }))
 }
 
-fn save_control(target: &str, control: &Control) -> std::result::Result<(), HelloError> {
+fn save_control(target: &str, control: &Control) -> HelloResult<()> {
     let mut bytes = Vec::with_capacity(22);
     bytes.extend_from_slice(CONTROL_MAGIC);
     bytes.push(u8::from(control.discarding));
@@ -945,21 +852,20 @@ fn save_control(target: &str, control: &Control) -> std::result::Result<(), Hell
     save_credential(target, "", "", "", &bytes, &CredPersist::Local).map_err(platform)
 }
 
-fn random_generation() -> std::result::Result<[u8; 16], HelloError> {
+fn random_generation() -> HelloResult<[u8; 16]> {
     let mut generation = [0; 16];
-    getrandom::fill(&mut generation).map_err(|error| HelloError::Platform(error.to_string()))?;
+    getrandom::fill(&mut generation).map_err(platform)?;
     Ok(generation)
 }
 
-fn delete_owned(target: &str) -> std::result::Result<(), HelloError> {
+fn delete_owned(target: &str) -> HelloResult<()> {
     match delete_credential(target) {
         Ok(()) | Err(Error::NoEntry) => Ok(()),
         Err(error) => Err(platform(error)),
     }
 }
 
-#[cfg(feature = "search")]
-fn decode_hex(encoded: &str) -> std::result::Result<String, HelloError> {
+fn decode_hex(encoded: &str) -> HelloResult<String> {
     fn digit(value: u8) -> Option<u8> {
         match value {
             b'0'..=b'9' => Some(value - b'0'),
@@ -981,14 +887,6 @@ fn decode_hex(encoded: &str) -> std::result::Result<String, HelloError> {
     }
     String::from_utf8(decoded)
         .map_err(|_| HelloError::Corrupt("invalid scoped target UTF-8".into()))
-}
-
-fn append_hex(out: &mut String, bytes: &[u8]) {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    for &byte in bytes {
-        out.push(char::from(HEX[usize::from(byte >> 4)]));
-        out.push(char::from(HEX[usize::from(byte & 15)]));
-    }
 }
 
 #[cfg(test)]
@@ -1028,20 +926,24 @@ mod tests {
         let gate = Gate::new("length-test", "store").unwrap();
         let secret = vec![0u8; MAX_PROTECTED_PLAINTEXT + 1];
         assert!(matches!(
-            gate.set_secret("scoped", "legacy", "user", &secret),
+            gate.set_secret("scoped", "user", &secret),
             Err(Error::TooLong(_, limit)) if limit as usize == MAX_PROTECTED_PLAINTEXT
         ));
     }
 
-    #[test]
-    fn locking_during_unlock_prevents_late_key_publication() {
-        const REQUEST: u64 = 13;
-        let gate = Gate::new("test", "concurrent-lock").unwrap();
-        let cancellation = HelloCancellation::new();
+    const REQUEST: u64 = 13;
+
+    type Outcome = (u64, std::result::Result<(), HelloError>);
+
+    /// Starts an unlock whose work blocks until `REQUEST` is sent on the returned sender.
+    fn hold_unlock(
+        gate: &Arc<Gate>,
+        cancellation: HelloCancellation,
+    ) -> (mpsc::Sender<u64>, mpsc::Receiver<Outcome>) {
         let (entered_tx, entered_rx) = mpsc::channel();
         let (release_tx, release_rx) = mpsc::channel();
         let (result_tx, result_rx) = mpsc::channel();
-        let worker_gate = Arc::clone(&gate);
+        let worker_gate = Arc::clone(gate);
         std::thread::spawn(move || {
             let result =
                 worker_gate.unlock_with(&cancellation, Duration::from_secs(2), move |_, _, _| {
@@ -1054,60 +956,63 @@ mod tests {
                 });
             result_tx.send((REQUEST, result)).unwrap();
         });
-
-        let entered = entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(entered, REQUEST);
-        gate.lock();
-        release_tx.send(REQUEST).unwrap();
-        let (completed, result) = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(completed, REQUEST);
-        assert!(matches!(result, Err(HelloError::Cancelled)));
-        assert_eq!(gate.protection(), Protection::Locked);
-        assert!(matches!(
-            gate.get_secret("target", "legacy"),
-            Err(Error::NoStorageAccess(_))
-        ));
-    }
-    #[test]
-    fn cancelling_an_inflight_unlock_keeps_the_store_locked() {
-        const REQUEST: u64 = 29;
-        let gate = Gate::new("test", "cancel-unlock").unwrap();
-        let cancellation = HelloCancellation::new();
-        let caller_cancel = cancellation.clone();
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
-        let worker_gate = Arc::clone(&gate);
-        std::thread::spawn(move || {
-            let result =
-                worker_gate.unlock_with(&cancellation, Duration::from_secs(2), move |_, _, _| {
-                    entered_tx.send(REQUEST).unwrap();
-                    let released = release_rx
-                        .recv_timeout(Duration::from_secs(2))
-                        .map_err(|_| HelloError::TimedOut)?;
-                    assert_eq!(released, REQUEST);
-                    Ok(Zeroizing::new([3; 32]))
-                });
-            result_tx.send((REQUEST, result)).unwrap();
-        });
-
         assert_eq!(
             entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
             REQUEST
         );
-        caller_cancel.cancel();
-        let (completed, result) = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        (release_tx, result_rx)
+    }
+
+    fn assert_cancelled(results: &mpsc::Receiver<Outcome>) {
+        let (completed, result) = results.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(completed, REQUEST);
         assert!(matches!(result, Err(HelloError::Cancelled)));
-        release_tx.send(REQUEST).unwrap();
+    }
+
+    fn refusal(gate: &Gate) -> Option<HelloError> {
+        match gate.get_secret(&gate.scoped_target("legacy").unwrap()) {
+            Err(Error::NoStorageAccess(reason)) => reason.downcast_ref::<HelloError>().cloned(),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn locking_during_unlock_prevents_late_key_publication() {
+        let gate = Gate::new("test", "concurrent-lock").unwrap();
+        let (release, results) = hold_unlock(&gate, HelloCancellation::new());
+        gate.lock();
+        release.send(REQUEST).unwrap();
+        assert_cancelled(&results);
+        assert_eq!(gate.protection(), Protection::Locked);
+        assert_eq!(refusal(&gate), Some(HelloError::Locked));
+    }
+
+    #[test]
+    fn lock_revokes_a_finished_unlock_before_it_can_publish() {
+        let gate = Gate::new("test", "lock-race").unwrap();
+        let (release, results) = hold_unlock(&gate, HelloCancellation::new());
+        let mut state = unpoison(gate.state.lock());
+        let request = state.active.clone().unwrap();
+        state.revoke();
+        let published = state.settle(&request, Ok(Zeroizing::new([1; 32])));
+        assert!(matches!(published, Err(HelloError::Cancelled)));
+        assert!(state.key.is_none());
+        drop(state);
+        release.send(REQUEST).unwrap();
+        assert_cancelled(&results);
+        assert_eq!(gate.protection(), Protection::Locked);
+    }
+
+    #[test]
+    fn cancelling_an_inflight_unlock_keeps_the_store_locked() {
+        let gate = Gate::new("test", "cancel-unlock").unwrap();
+        let cancellation = HelloCancellation::new();
+        let (release, results) = hold_unlock(&gate, cancellation.clone());
+        cancellation.cancel();
+        assert_cancelled(&results);
+        release.send(REQUEST).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
-        while gate
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .active
-            .is_some()
-        {
+        while unpoison(gate.state.lock()).active.is_some() {
             assert!(
                 Instant::now() < deadline,
                 "cancelled worker failed to finish"
@@ -1119,42 +1024,14 @@ mod tests {
 
     #[test]
     fn discarding_during_unlock_never_publishes_a_key() {
-        const REQUEST: u64 = 41;
         let gate = Gate::new("test", &format!("discard-unlock-{}", fastrand::u64(..))).unwrap();
-        let cancellation = HelloCancellation::new();
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel();
-        let (result_tx, result_rx) = mpsc::channel();
-        let worker_gate = Arc::clone(&gate);
-        std::thread::spawn(move || {
-            let result =
-                worker_gate.unlock_with(&cancellation, Duration::from_secs(2), move |_, _, _| {
-                    entered_tx.send(REQUEST).unwrap();
-                    let released = release_rx
-                        .recv_timeout(Duration::from_secs(2))
-                        .map_err(|_| HelloError::TimedOut)?;
-                    assert_eq!(released, REQUEST);
-                    Ok(Zeroizing::new([5; 32]))
-                });
-            result_tx.send((REQUEST, result)).unwrap();
-        });
-
-        assert_eq!(
-            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
-            REQUEST
-        );
+        let (release, results) = hold_unlock(&gate, HelloCancellation::new());
         gate.discard(Duration::from_secs(2)).unwrap();
-        release_tx.send(REQUEST).unwrap();
-        let (completed, result) = result_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        assert_eq!(completed, REQUEST);
-        assert!(matches!(result, Err(HelloError::Cancelled)));
+        release.send(REQUEST).unwrap();
+        assert_cancelled(&results);
         assert_eq!(gate.protection(), Protection::Locked);
-        let refused = gate.get_secret("target", "legacy");
+        let refused = refusal(&gate);
         crate::utils::delete_credential(&gate.control_target()).unwrap();
-        assert!(matches!(
-            refused,
-            Err(Error::NoStorageAccess(reason))
-                if matches!(reason.downcast_ref::<HelloError>(), Some(HelloError::Discarded))
-        ));
+        assert_eq!(refused, Some(HelloError::Discarded));
     }
 }

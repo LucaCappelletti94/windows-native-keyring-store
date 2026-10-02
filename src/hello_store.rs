@@ -53,7 +53,7 @@ impl HelloStore {
 
     /// Check for a selectable Hello authenticator without claiming PRF support.
     pub fn capability() -> std::result::Result<(), HelloError> {
-        Gate::capability()
+        crate::hello_native::available()
     }
     #[cfg(test)]
     pub(crate) fn install_test_key(&self, key: [u8; 32]) {
@@ -108,9 +108,7 @@ impl CredentialStoreApi for HelloStore {
         let delimiters = [String::new(), ".".into(), String::new()];
         let mut cred =
             Cred::build_from_specifiers(None, &delimiters, false, service, user, persistence)?;
-        let legacy = std::mem::take(&mut cred.target_name);
-        cred.target_name = self.gate.scoped_target(&legacy)?;
-        cred.legacy_target = Some(legacy);
+        cred.target_name = self.gate.scoped_target(&cred.target_name)?;
         cred.hello = Some(Arc::clone(&self.gate));
         Ok(Entry::new_with_credential(Arc::new(cred)))
     }

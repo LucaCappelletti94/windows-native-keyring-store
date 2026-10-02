@@ -22,20 +22,13 @@ pub(crate) fn is_protected(blob: &[u8]) -> bool {
 }
 
 /// Bind length-prefixed store and target names to the ciphertext.
-fn associated_data(store: &str, target: &str) -> Result<Vec<u8>, HelloError> {
+fn associated_data(store: &str, target: &str) -> Vec<u8> {
     let mut ad = Vec::with_capacity(8 + store.len() + 8 + target.len());
-    append_name(&mut ad, store)?;
-    append_name(&mut ad, target)?;
-    Ok(ad)
-}
-
-fn append_name(ad: &mut Vec<u8>, name: &str) -> Result<(), HelloError> {
-    let bytes = name.as_bytes();
-    let len = u64::try_from(bytes.len())
-        .map_err(|_| HelloError::Platform("associated data name length exceeds u64".into()))?;
-    ad.extend_from_slice(&len.to_be_bytes());
-    ad.extend_from_slice(bytes);
-    Ok(())
+    for name in [store, target] {
+        ad.extend_from_slice(&(name.len() as u64).to_be_bytes());
+        ad.extend_from_slice(name.as_bytes());
+    }
+    ad
 }
 
 /// Seal with a fresh nonce from the system random source.
@@ -52,7 +45,7 @@ pub(crate) fn seal(
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|error| HelloError::Platform(format!("sealing key setup failed: {error}")))?;
     let nonce: &Nonce<Aes256Gcm> = nonce_bytes.as_slice().into();
-    let ad = associated_data(store, target)?;
+    let ad = associated_data(store, target);
 
     let mut blob = Zeroizing::new(Vec::with_capacity(MIN_BLOB_LEN + plain.len()));
     blob.extend_from_slice(&MAGIC);
@@ -98,7 +91,7 @@ pub(crate) fn open(
 
     let cipher = Aes256Gcm::new_from_slice(key)
         .map_err(|error| HelloError::Platform(format!("sealing key setup failed: {error}")))?;
-    let ad = associated_data(store, target)?;
+    let ad = associated_data(store, target);
 
     let mut buffer = Zeroizing::new(blob[NONCE_END..].to_vec());
     cipher
@@ -111,6 +104,7 @@ pub(crate) fn open(
         })?;
     Ok(buffer)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,10 +114,6 @@ mod tests {
 
     fn key() -> [u8; 32] {
         [0x5A; 32]
-    }
-
-    fn other_key() -> [u8; 32] {
-        [0xA5; 32]
     }
 
     fn seal_default(plain: &[u8]) -> Vec<u8> {
@@ -151,13 +141,9 @@ mod tests {
         assert_eq!(blob[VERSION_AT], FORMAT_VERSION);
         assert!(is_protected(&blob));
         assert_eq!(open_default(&blob).as_slice(), secret);
-    }
-
-    #[test]
-    fn roundtrip_recovers_empty_secret() {
-        let blob = seal_default(b"");
-        assert_eq!(blob.len(), MIN_BLOB_LEN);
-        assert!(open_default(&blob).is_empty());
+        let empty = seal_default(b"");
+        assert_eq!(empty.len(), MIN_BLOB_LEN);
+        assert!(open_default(&empty).is_empty());
     }
 
     #[test]
@@ -178,35 +164,19 @@ mod tests {
     }
 
     #[test]
-    fn open_rejects_tampered_ciphertext() {
-        let mut blob = seal_default(b"tamper me");
-        blob[NONCE_END] ^= 0x01;
-        assert_corrupt(open(&key(), STORE, TARGET, &blob));
+    fn open_rejects_tampered_ciphertext_and_tag() {
+        for at in [NONCE_END, NONCE_END + 9 + TAG_LEN - 1] {
+            let mut blob = seal_default(b"tamper me");
+            blob[at] ^= 0x01;
+            assert_corrupt(open(&key(), STORE, TARGET, &blob));
+        }
     }
 
     #[test]
-    fn open_rejects_tampered_tag() {
-        let mut blob = seal_default(b"tamper me");
-        let last = blob.len() - 1;
-        blob[last] ^= 0x80;
-        assert_corrupt(open(&key(), STORE, TARGET, &blob));
-    }
-
-    #[test]
-    fn open_rejects_wrong_key() {
+    fn open_rejects_wrong_key_store_or_target() {
         let blob = seal_default(b"secret");
-        assert_corrupt(open(&other_key(), STORE, TARGET, &blob));
-    }
-
-    #[test]
-    fn open_rejects_wrong_store() {
-        let blob = seal_default(b"secret");
+        assert_corrupt(open(&[0xA5; 32], STORE, TARGET, &blob));
         assert_corrupt(open(&key(), "other.store", TARGET, &blob));
-    }
-
-    #[test]
-    fn open_rejects_wrong_target() {
-        let blob = seal_default(b"secret");
         assert_corrupt(open(&key(), STORE, "myapp.store/other", &blob));
     }
 

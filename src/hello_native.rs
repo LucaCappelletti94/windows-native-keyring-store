@@ -21,6 +21,8 @@ use libloading::{
 };
 use zeroize::Zeroizing;
 
+use crate::utils::from_wstr;
+
 use windows_sys::Win32::Foundation::HWND;
 use windows_sys::Win32::UI::WindowsAndMessaging::IsWindow;
 
@@ -29,9 +31,9 @@ use crate::hello::{HelloError, MAX_CREDENTIAL_ID};
 const API_VERSION_REQUIRED: u32 = 9;
 const MAKE_OPTIONS_VERSION: u32 = 9;
 const GET_OPTIONS_VERSION: u32 = 9;
-// PRF fields (pHmacSecret) exist from attestation 7 and assertion 3.
-const ATTESTATION_VERSION_MIN: u32 = 7;
-const ASSERTION_VERSION_MIN: u32 = 3;
+// The mirrored `Attestation` and `Assertion` layouts are versions 8 and 6, which API 9 returns.
+const ATTESTATION_VERSION_MIN: u32 = 8;
+const ASSERTION_VERSION_MIN: u32 = 6;
 const HMAC_SECRET_LENGTH: u32 = 32;
 const RAW_SALT_FLAG: u32 = 0x00100000;
 const TRANSPORT_INTERNAL: u32 = 0x0000_0010;
@@ -97,25 +99,31 @@ impl HelloCancellation {
     }
 
     pub fn cancel(&self) {
-        // Set the flag before delivering to native so any concurrent reader
-        // sees the cancellation even if the native call already returned.
-        if self.inner.cancelled.swap(true, Ordering::AcqRel) {
-            return;
-        }
+        self.mark_cancelled();
+        self.abort_native();
+    }
+
+    /// Sets the flag that every operation and waiter checks.
+    pub(crate) fn mark_cancelled(&self) {
+        self.inner.cancelled.store(true, Ordering::Release);
+    }
+
+    /// Asks webauthn.dll to abort the active native operation, if one is running.
+    pub(crate) fn abort_native(&self) {
         let Some(guid) = self.active_guid() else {
             return;
         };
         let Ok(lib) = load_system_webauthn() else {
             return;
         };
-        let Ok(symbol) =
-            (unsafe { lib.get::<CancelCurrentOperation>(b"WebAuthNCancelCurrentOperation") })
+        // SAFETY: the declared type matches the `WebAuthNCancelCurrentOperation` signature.
+        let Ok(abort) =
+            (unsafe { resolve::<CancelCurrentOperation>(&lib, "WebAuthNCancelCurrentOperation") })
         else {
             return;
         };
-        // A copied function pointer is stable for the process lifetime.
-        let cancel = *symbol;
-        let _ = unsafe { cancel(&guid) };
+        // SAFETY: `lib` stays loaded for the call and `guid` identifies the active operation.
+        let _ = unsafe { abort(&guid) };
     }
 
     fn install_active(&self, guid: Guid) {
@@ -131,11 +139,7 @@ impl HelloCancellation {
     }
 
     fn lock_active(&self) -> MutexGuard<'_, Option<Guid>> {
-        // A poisoned lock leaves no state this type depends on, so recover the guard.
-        self.inner
-            .active
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        crate::hello::unpoison(self.inner.active.lock())
     }
 }
 
@@ -321,6 +325,38 @@ struct GetOptions {
     pb_authenticator_id: *const u8,
 }
 
+/// FFI records whose fields are all integers, nullable pointers, or other such records.
+///
+/// # Safety
+/// The all-zero bit pattern must be a valid value of the implementing type.
+unsafe trait Zeroable: Sized {}
+
+// SAFETY: each record holds only integers, nullable raw pointers, and zeroable records.
+unsafe impl Zeroable for Guid {}
+// SAFETY: as above.
+unsafe impl Zeroable for HmacSalt {}
+// SAFETY: as above.
+unsafe impl Zeroable for MakeOptions {}
+// SAFETY: as above.
+unsafe impl Zeroable for GetOptions {}
+// SAFETY: as above.
+unsafe impl Zeroable for Attestation {}
+// SAFETY: as above.
+unsafe impl Zeroable for Assertion {}
+
+fn zeroed<T: Zeroable>() -> T {
+    // SAFETY: `Zeroable` guarantees all-zero bytes are a valid `T`.
+    unsafe { std::mem::zeroed() }
+}
+
+fn prf_salt(salt: &[u8; 32]) -> HmacSalt {
+    HmacSalt {
+        cb_first: HMAC_SECRET_LENGTH,
+        pb_first: salt.as_ptr(),
+        ..zeroed()
+    }
+}
+
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct Attestation {
@@ -386,6 +422,7 @@ struct GetCredentialsOptions {
     browser_in_private_mode: i32,
 }
 
+/// The version 1 prefix of `WEBAUTHN_CREDENTIAL_DETAILS`, which later versions only extend.
 #[derive(Clone, Copy)]
 #[repr(C)]
 struct CredentialDetails {
@@ -395,12 +432,6 @@ struct CredentialDetails {
     rp_information: *const RpEntity,
     user_information: *const UserEntity,
     removable: i32,
-    backed_up: i32,
-    authenticator_name: *const u16,
-    cb_authenticator_logo: u32,
-    pb_authenticator_logo: *const u8,
-    third_party_payment: i32,
-    transports: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -485,19 +516,20 @@ struct WebAuthn {
     get_authenticator_list: GetAuthenticatorList,
     free_authenticator_list: FreeAuthenticatorList,
     delete_platform_credential: DeletePlatformCredential,
-    get_error_name: GetErrorName,
+    // Optional because it only decorates error messages.
+    get_error_name: Option<GetErrorName>,
 }
 
-macro_rules! resolve_symbol {
-    ($lib:expr, $ty:ty, $name:literal) => {{
-        // A copied function pointer is stable for the process lifetime.
-        let symbol = (unsafe { $lib.get::<$ty>($name.as_bytes()) }).map_err(|_| {
-            HelloError::Unsupported(
-                concat!("webauthn.dll is missing the ", $name, " export").into(),
-            )
-        })?;
-        *symbol
-    }};
+/// Copies the `name` export out of `lib` as a function pointer.
+///
+/// # Safety
+/// `T` must be the export's exact function-pointer type, and `lib` must outlive every use.
+unsafe fn resolve<T: Copy>(lib: &Library, name: &str) -> Result<T, HelloError> {
+    // SAFETY: the caller guarantees `T` matches the export's signature.
+    let symbol = unsafe { lib.get::<T>(name.as_bytes()) }.map_err(|_| {
+        HelloError::Unsupported(format!("webauthn.dll is missing the {name} export"))
+    })?;
+    Ok(*symbol)
 }
 
 fn load_system_webauthn() -> Result<Library, libloading::Error> {
@@ -510,62 +542,34 @@ fn load() -> Result<WebAuthn, HelloError> {
     let lib = load_system_webauthn().map_err(|error| {
         HelloError::Unsupported(format!("webauthn.dll could not be loaded. {error}"))
     })?;
-    let api_version_number =
-        resolve_symbol!(lib, GetApiVersionNumber, "WebAuthNGetApiVersionNumber");
-    // SAFETY: the call takes no arguments and returns a version number.
-    let version = unsafe { api_version_number() };
-    if version < API_VERSION_REQUIRED {
-        return Err(HelloError::Unsupported(format!(
-            "webauthn API version {version} is below the required {API_VERSION_REQUIRED}"
-        )));
+    // SAFETY: each type is the webauthn.h signature of the export it is resolved from, and
+    // `WebAuthn` keeps `lib` loaded for as long as the copied pointers are used.
+    unsafe {
+        let version = resolve::<GetApiVersionNumber>(&lib, "WebAuthNGetApiVersionNumber")?();
+        if version < API_VERSION_REQUIRED {
+            return Err(HelloError::Unsupported(format!(
+                "webauthn API version {version} is below the required {API_VERSION_REQUIRED}"
+            )));
+        }
+        Ok(WebAuthn {
+            uv_available: resolve(
+                &lib,
+                "WebAuthNIsUserVerifyingPlatformAuthenticatorAvailable",
+            )?,
+            make_credential: resolve(&lib, "WebAuthNAuthenticatorMakeCredential")?,
+            get_assertion: resolve(&lib, "WebAuthNAuthenticatorGetAssertion")?,
+            free_attestation: resolve(&lib, "WebAuthNFreeCredentialAttestation")?,
+            free_assertion: resolve(&lib, "WebAuthNFreeAssertion")?,
+            get_cancellation_id: resolve(&lib, "WebAuthNGetCancellationId")?,
+            get_platform_credential_list: resolve(&lib, "WebAuthNGetPlatformCredentialList")?,
+            free_platform_credential_list: resolve(&lib, "WebAuthNFreePlatformCredentialList")?,
+            get_authenticator_list: resolve(&lib, "WebAuthNGetAuthenticatorList")?,
+            free_authenticator_list: resolve(&lib, "WebAuthNFreeAuthenticatorList")?,
+            delete_platform_credential: resolve(&lib, "WebAuthNDeletePlatformCredential")?,
+            get_error_name: resolve(&lib, "WebAuthNGetErrorName").ok(),
+            _lib: lib,
+        })
     }
-    let uv_available = resolve_symbol!(
-        lib,
-        UvAvailable,
-        "WebAuthNIsUserVerifyingPlatformAuthenticatorAvailable"
-    );
-    let make_credential =
-        resolve_symbol!(lib, MakeCredential, "WebAuthNAuthenticatorMakeCredential");
-    let get_assertion = resolve_symbol!(lib, GetAssertion, "WebAuthNAuthenticatorGetAssertion");
-    let free_attestation =
-        resolve_symbol!(lib, FreeAttestation, "WebAuthNFreeCredentialAttestation");
-    let free_assertion = resolve_symbol!(lib, FreeAssertion, "WebAuthNFreeAssertion");
-    let get_cancellation_id = resolve_symbol!(lib, GetCancellationId, "WebAuthNGetCancellationId");
-    let get_platform_credential_list = resolve_symbol!(
-        lib,
-        GetPlatformCredentialList,
-        "WebAuthNGetPlatformCredentialList"
-    );
-    let free_platform_credential_list = resolve_symbol!(
-        lib,
-        FreePlatformCredentialList,
-        "WebAuthNFreePlatformCredentialList"
-    );
-    let get_authenticator_list =
-        resolve_symbol!(lib, GetAuthenticatorList, "WebAuthNGetAuthenticatorList");
-    let free_authenticator_list =
-        resolve_symbol!(lib, FreeAuthenticatorList, "WebAuthNFreeAuthenticatorList");
-    let delete_platform_credential = resolve_symbol!(
-        lib,
-        DeletePlatformCredential,
-        "WebAuthNDeletePlatformCredential"
-    );
-    let get_error_name = resolve_symbol!(lib, GetErrorName, "WebAuthNGetErrorName");
-    Ok(WebAuthn {
-        _lib: lib,
-        uv_available,
-        make_credential,
-        get_assertion,
-        free_attestation,
-        free_assertion,
-        get_cancellation_id,
-        get_platform_credential_list,
-        free_platform_credential_list,
-        get_authenticator_list,
-        free_authenticator_list,
-        delete_platform_credential,
-        get_error_name,
-    })
 }
 
 /// Owns native scratch buffers not borrowed from the operation frame.
@@ -605,6 +609,53 @@ pub(crate) fn available() -> Result<(), HelloError> {
     Ok(())
 }
 
+/// Checked prerequisites shared by enrollment and assertion.
+struct Ceremony {
+    api: WebAuthn,
+    hwnd: HWND,
+    guid: Guid,
+    authenticator_id: Vec<u8>,
+}
+
+impl Ceremony {
+    fn begin(owner: &Arc<dyn HelloWindow>, cancel: &HelloCancellation) -> Result<Self, HelloError> {
+        let hwnd = live_owner_window(owner)?;
+        if cancel.is_cancelled() {
+            return Err(HelloError::Cancelled);
+        }
+        let api = load()?;
+        platform_authenticator_available(&api)?;
+        let authenticator_id = select_hello_authenticator(&api)?;
+        let guid = get_cancellation_id(&api)?;
+        Ok(Self {
+            api,
+            hwnd,
+            guid,
+            authenticator_id,
+        })
+    }
+
+    fn authenticator_len(&self) -> u32 {
+        u32::try_from(self.authenticator_id.len()).expect("authenticator id length came from a u32")
+    }
+
+    /// Runs the blocking native call while `cancel` can abort it through this ceremony's id.
+    fn run(
+        &self,
+        cancel: &HelloCancellation,
+        call: impl FnOnce() -> i32,
+    ) -> Result<i32, HelloError> {
+        cancel.install_active(self.guid);
+        if cancel.is_cancelled() {
+            cancel.clear_active();
+            return Err(HelloError::Cancelled);
+        }
+        let hr = call();
+        cancel.clear_active();
+        Ok(hr)
+    }
+}
+
 /// Enrolls the Hello PRF credential for `rp_id` under the caller-provided
 /// `user_id` and raw `salt`.
 pub(crate) fn enroll(
@@ -615,20 +666,10 @@ pub(crate) fn enroll(
     cancel: &HelloCancellation,
     timeout: Duration,
 ) -> Result<Enrollment, HelloError> {
-    let hwnd = live_owner_window(&owner)?;
-    if cancel.is_cancelled() {
-        return Err(HelloError::Cancelled);
-    }
-    let api = load()?;
-    platform_authenticator_available(&api)?;
-    let selector = select_hello_authenticator(&api)?;
-    let guid = get_cancellation_id(&api)?;
-    let selector_len = u32::try_from(selector.id.len())
-        .map_err(|_| HelloError::Corrupt("authenticator ID is too long".into()))?;
-
+    let ceremony = Ceremony::begin(&owner, cancel)?;
+    let api = &ceremony.api;
     let mut bufs = NativeBuffers::new();
     let rp = build_rp_entity(&mut bufs, rp_id);
-    let rp_ptr = &rp;
     let user = UserEntity {
         version: 1,
         cb_id: 32,
@@ -637,108 +678,64 @@ pub(crate) fn enroll(
         icon: std::ptr::null(),
         display_name: bufs.add_wide("Windows Hello PRF Store"),
     };
-    let user_ptr = &user;
     let param = CoseParam {
         version: 1,
         credential_type: bufs.add_wide("public-key"),
         alg: ALG_ES256,
     };
-    let param_ptr = &param;
     let params = CoseParams {
         count: 1,
-        params: param_ptr,
+        params: &param,
     };
-    let params_ptr = &params;
     let client = build_client_data(&mut bufs, "create", rp_id)?;
-    let client_ptr = &client;
-    let cancellation_ptr = &guid;
-    let salt_value = HmacSalt {
-        cb_first: HMAC_SECRET_LENGTH,
-        pb_first: salt.as_ptr(),
-        cb_second: 0,
-        pb_second: std::ptr::null(),
-    };
-    let salt_ptr = &salt_value;
-    let selector_id = selector.id.as_ptr();
+    let salt_value = prf_salt(salt);
     let options = MakeOptions {
         version: MAKE_OPTIONS_VERSION,
         timeout_ms: timeout_ms(timeout),
-        credential_list: Credentials {
-            count: 0,
-            credentials: std::ptr::null(),
-        },
-        extensions: Extensions {
-            count: 0,
-            extensions: std::ptr::null(),
-        },
         authenticator_attachment: ATTACHMENT_PLATFORM,
-        require_resident_key: 0,
         uv_requirement: UV_REQUIREMENT_REQUIRED,
         attestation_conveyance: ATTESTATION_CONVEYANCE_NONE,
         flags: RAW_SALT_FLAG,
-        cancellation_id: cancellation_ptr,
-        exclude_credential_list: std::ptr::null(),
-        enterprise_attestation: 0,
-        large_blob_support: 0,
-        prefer_resident_key: 0,
-        browser_in_private_mode: 0,
+        cancellation_id: &ceremony.guid,
         enable_prf: 1,
-        linked_device: std::ptr::null(),
-        cb_json_ext: 0,
-        pb_json_ext: std::ptr::null(),
-        prf_global_eval: salt_ptr,
-        credential_hints_count: 0,
-        credential_hints: std::ptr::null(),
-        third_party_payment: 0,
-        remote_web_origin: std::ptr::null(),
-        cb_creation_options_json: 0,
-        pb_creation_options_json: std::ptr::null(),
-        cb_authenticator_id: selector_len,
-        pb_authenticator_id: selector_id,
+        prf_global_eval: &salt_value,
+        cb_authenticator_id: ceremony.authenticator_len(),
+        pb_authenticator_id: ceremony.authenticator_id.as_ptr(),
+        ..zeroed()
     };
-    let options_ptr = &options;
-
-    cancel.install_active(guid);
-    if cancel.is_cancelled() {
-        cancel.clear_active();
-        return Err(HelloError::Cancelled);
-    }
-    // The owner Arc outlives the blocking native call.
     let mut attestation: *const Attestation = std::ptr::null();
-    // SAFETY: every pointer passed in is owned by bufs or the stack and stays
-    // valid until the call returns. The out pointer is initialized.
-    let hr = unsafe {
-        (api.make_credential)(
-            hwnd,
-            rp_ptr,
-            user_ptr,
-            params_ptr,
-            client_ptr,
-            options_ptr,
-            &mut attestation,
-        )
-    };
-    cancel.clear_active();
-    if hr != S_OK {
-        delete_created_credential(&api, rp_id, user_id)?;
-        return Err(operation_error(&api, hr, "make credential", cancel));
-    }
-    let outcome = if attestation.is_null() {
+    let hr = ceremony.run(cancel, || {
+        // SAFETY: every pointer is owned by `bufs` or this frame and outlives the call; the
+        // owner `Arc` keeps the window alive.
+        unsafe {
+            (api.make_credential)(
+                ceremony.hwnd,
+                &rp,
+                &user,
+                &params,
+                &client,
+                &options,
+                &mut attestation,
+            )
+        }
+    })?;
+    let outcome = if hr != S_OK {
+        Err(operation_error(api, hr, "make credential", cancel))
+    } else if attestation.is_null() {
         Err(HelloError::Corrupt(
             "make credential returned a null attestation".into(),
         ))
     } else {
-        // SAFETY: a successful make returns a valid, non-null attestation.
-        read_attestation(unsafe { &*attestation })
-    };
-    if !attestation.is_null() {
+        // SAFETY: a successful make returns a non-null attestation that starts with its version.
+        let outcome = unsafe { read_attestation(attestation) };
         // SAFETY: webauthn.dll allocated this attestation and owns its free function.
         unsafe { (api.free_attestation)(attestation) };
-    }
+        outcome
+    };
     match outcome {
         Ok((credential_id, key)) => Ok(Enrollment { credential_id, key }),
         Err(error) => {
-            delete_created_credential(&api, rp_id, user_id)?;
+            delete_created_credential(api, rp_id, user_id)?;
             Err(error)
         }
     }
@@ -753,22 +750,12 @@ pub(crate) fn assert_prf(
     cancel: &HelloCancellation,
     timeout: Duration,
 ) -> Result<Zeroizing<[u8; 32]>, HelloError> {
-    let hwnd = live_owner_window(&owner)?;
-    if cancel.is_cancelled() {
-        return Err(HelloError::Cancelled);
-    }
-    let api = load()?;
-    platform_authenticator_available(&api)?;
-    let selector = select_hello_authenticator(&api)?;
-    let guid = get_cancellation_id(&api)?;
-    let selector_len = u32::try_from(selector.id.len())
-        .map_err(|_| HelloError::Corrupt("authenticator ID is too long".into()))?;
+    let ceremony = Ceremony::begin(&owner, cancel)?;
+    let api = &ceremony.api;
     let credential_len = u32::try_from(credential_id.len())
         .map_err(|_| HelloError::Corrupt("credential ID is too long".into()))?;
-
     let mut bufs = NativeBuffers::new();
     let client = build_client_data(&mut bufs, "get", rp_id)?;
-    let client_ptr = &client;
     let credential_ex = CredentialEx {
         version: 1,
         cb_id: credential_len,
@@ -777,87 +764,47 @@ pub(crate) fn assert_prf(
         // 0 means no transport restriction, since the authenticator id binding routes the call.
         transports: 0,
     };
-    let credential_ptr: *const CredentialEx = &credential_ex;
-    let allow_array = [credential_ptr];
-    let allow_array_ptr = allow_array.as_ptr();
+    let allow_array = [&credential_ex as *const CredentialEx];
     let allow_list = CredentialList {
         count: 1,
-        credentials: allow_array_ptr,
+        credentials: allow_array.as_ptr(),
     };
-    let allow_list_ptr = &allow_list;
-    let first = HmacSalt {
-        cb_first: HMAC_SECRET_LENGTH,
-        pb_first: salt.as_ptr(),
-        cb_second: 0,
-        pb_second: std::ptr::null(),
-    };
-    let first_ptr = &first;
+    let first = prf_salt(salt);
     let salt_values = HmacSaltValues {
-        global_salt: first_ptr,
+        global_salt: &first,
         count_with_salt: 0,
         with_salt_list: std::ptr::null(),
     };
-    let salt_values_ptr = &salt_values;
-    let cancellation_ptr = &guid;
-    let selector_id = selector.id.as_ptr();
     let options = GetOptions {
         version: GET_OPTIONS_VERSION,
         timeout_ms: timeout_ms(timeout),
-        credential_list: Credentials {
-            count: 0,
-            credentials: std::ptr::null(),
-        },
-        extensions: Extensions {
-            count: 0,
-            extensions: std::ptr::null(),
-        },
         authenticator_attachment: ATTACHMENT_PLATFORM,
         uv_requirement: UV_REQUIREMENT_REQUIRED,
         flags: RAW_SALT_FLAG,
-        u2f_app_id: std::ptr::null(),
-        u2f_app_id_used: std::ptr::null_mut(),
-        cancellation_id: cancellation_ptr,
-        allow_credential_list: allow_list_ptr,
-        cred_large_blob_operation: 0,
-        cb_cred_large_blob: 0,
-        pb_cred_large_blob: std::ptr::null(),
-        hmac_secret_salt_values: salt_values_ptr,
-        browser_in_private_mode: 0,
-        linked_device: std::ptr::null(),
-        auto_fill: 0,
-        cb_json_ext: 0,
-        pb_json_ext: std::ptr::null(),
-        credential_hints_count: 0,
-        credential_hints: std::ptr::null(),
-        remote_web_origin: std::ptr::null(),
-        cb_request_options_json: 0,
-        pb_request_options_json: std::ptr::null(),
-        cb_authenticator_id: selector_len,
-        pb_authenticator_id: selector_id,
+        cancellation_id: &ceremony.guid,
+        allow_credential_list: &allow_list,
+        hmac_secret_salt_values: &salt_values,
+        cb_authenticator_id: ceremony.authenticator_len(),
+        pb_authenticator_id: ceremony.authenticator_id.as_ptr(),
+        ..zeroed()
     };
-    let options_ptr = &options;
     let rp_wide = bufs.add_wide(rp_id);
-
-    cancel.install_active(guid);
-    if cancel.is_cancelled() {
-        cancel.clear_active();
-        return Err(HelloError::Cancelled);
-    }
     let mut assertion: *const Assertion = std::ptr::null();
-    // SAFETY: every pointer passed in is owned by bufs or the stack and stays
-    // valid until the call returns. The out pointer is initialized.
-    let hr = unsafe { (api.get_assertion)(hwnd, rp_wide, client_ptr, options_ptr, &mut assertion) };
-    cancel.clear_active();
+    let hr = ceremony.run(cancel, || {
+        // SAFETY: every pointer is owned by `bufs` or this frame and outlives the call; the
+        // owner `Arc` keeps the window alive.
+        unsafe { (api.get_assertion)(ceremony.hwnd, rp_wide, &client, &options, &mut assertion) }
+    })?;
     if hr != S_OK {
-        return Err(operation_error(&api, hr, "get assertion", cancel));
+        return Err(operation_error(api, hr, "get assertion", cancel));
     }
     if assertion.is_null() {
         return Err(HelloError::Corrupt(
             "get assertion returned a null assertion".into(),
         ));
     }
-    // SAFETY: a successful get returns a valid, non-null assertion.
-    let outcome = read_assertion(unsafe { &*assertion }, credential_id);
+    // SAFETY: a successful get returns a non-null assertion that starts with its version.
+    let outcome = unsafe { read_assertion(assertion, credential_id) };
     // SAFETY: assertion was allocated by webauthn.dll and is freed here.
     unsafe { (api.free_assertion)(assertion) };
     outcome
@@ -865,49 +812,23 @@ pub(crate) fn assert_prf(
 
 /// Finds the platform credential created for exactly `rp_id` and `user_id`.
 ///
-/// Used at startup to salvage a credential left behind by a crashed
-/// enrollment. Returns an error when more than one credential matches.
+/// Recovers a credential left behind by a crashed enrollment, and refuses ambiguity.
 pub(crate) fn recover_created(
     rp_id: &str,
     user_id: &[u8; 32],
 ) -> Result<Option<Vec<u8>>, HelloError> {
-    let api = load()?;
-    let entries = list_platform_credentials(&api, rp_id)?;
-    let mut matches = entries.iter().filter(|entry| {
-        entry.rp_id.as_deref() == Some(rp_id)
-            && entry.user_id.as_deref() == Some(user_id.as_slice())
-            && !entry.credential_id.is_empty()
-    });
-    let Some(first) = matches.next() else {
-        return Ok(None);
-    };
-    let additional = matches.count();
-    if additional != 0 {
-        return Err(HelloError::Conflict(format!(
-            "{} platform credentials match the exact RP and user id",
-            additional + 1
-        )));
+    let mut ids = owned_credentials(&load()?, rp_id, Some(user_id))?;
+    match ids.len() {
+        0 | 1 => Ok(ids.pop()),
+        count => Err(HelloError::Conflict(format!(
+            "{count} platform credentials match the exact RP and user id"
+        ))),
     }
-    Ok(Some(first.credential_id.clone()))
 }
 
-/// Deletes the platform credential with the exact `credential_id`.
-///
-/// A credential that is already absent is not an error, and the removal is
-/// verified through the exact RP filter before returning.
+/// Deletes the platform credential with the exact `credential_id`, verifying its absence.
 pub(crate) fn remove_exact(rp_id: &str, credential_id: &[u8]) -> Result<(), HelloError> {
-    let api = load()?;
-    delete_credential(&api, credential_id)?;
-    let entries = list_platform_credentials(&api, rp_id)?;
-    if entries
-        .iter()
-        .any(|entry| entry.credential_id.as_slice() == credential_id)
-    {
-        return Err(HelloError::Corrupt(
-            "credential still listed after successful deletion".into(),
-        ));
-    }
-    Ok(())
+    delete_verified(&load()?, rp_id, &[credential_id.to_vec()])
 }
 
 /// Deletes every platform credential listed under exactly `rp_id`, verifying their absence.
@@ -920,18 +841,37 @@ pub(crate) fn remove_all_for_rp(rp_id: &str) -> Result<(), HelloError> {
         Err(HelloError::Unsupported(_)) => return Ok(()),
         Err(error) => return Err(error),
     };
-    let owned = |entry: &ListedCredential| {
-        entry.rp_id.as_deref() == Some(rp_id) && !entry.credential_id.is_empty()
-    };
-    for entry in list_platform_credentials(&api, rp_id)?
-        .iter()
-        .filter(|entry| owned(entry))
-    {
-        delete_credential(&api, &entry.credential_id)?;
+    let ids = owned_credentials(&api, rp_id, None)?;
+    delete_verified(&api, rp_id, &ids)
+}
+
+/// Credential IDs listed under exactly `rp_id`, narrowed to `user_id` when given.
+fn owned_credentials(
+    api: &WebAuthn,
+    rp_id: &str,
+    user_id: Option<&[u8; 32]>,
+) -> Result<Vec<Vec<u8>>, HelloError> {
+    Ok(list_platform_credentials(api, rp_id)?
+        .into_iter()
+        .filter(|entry| {
+            entry.rp_id == rp_id
+                && !entry.credential_id.is_empty()
+                && user_id.is_none_or(|user| entry.user_id.as_deref() == Some(user.as_slice()))
+        })
+        .map(|entry| entry.credential_id)
+        .collect())
+}
+
+fn delete_verified(api: &WebAuthn, rp_id: &str, ids: &[Vec<u8>]) -> Result<(), HelloError> {
+    for id in ids {
+        delete_credential(api, id)?;
     }
-    if list_platform_credentials(&api, rp_id)?.iter().any(owned) {
+    if list_platform_credentials(api, rp_id)?
+        .iter()
+        .any(|entry| ids.contains(&entry.credential_id))
+    {
         return Err(HelloError::Corrupt(
-            "store credential still listed after deletion".into(),
+            "platform credential still listed after deletion".into(),
         ));
     }
     Ok(())
@@ -948,7 +888,7 @@ fn build_rp_entity(bufs: &mut NativeBuffers, rp_id: &str) -> RpEntity {
 
 fn live_owner_window(owner: &Arc<dyn HelloWindow>) -> Result<HWND, HelloError> {
     let hwnd = owner.hwnd();
-    // A dead or null owner must fail before any native prompt can appear.
+    // SAFETY: `IsWindow` accepts any handle value; a dead or null owner fails before any prompt.
     if unsafe { IsWindow(hwnd) } == 0 {
         return Err(HelloError::MissingOwner);
     }
@@ -974,11 +914,7 @@ fn platform_authenticator_available(api: &WebAuthn) -> Result<(), HelloError> {
     Ok(())
 }
 
-struct HelloSelector {
-    id: Vec<u8>,
-}
-
-fn select_hello_authenticator(api: &WebAuthn) -> Result<HelloSelector, HelloError> {
+fn select_hello_authenticator(api: &WebAuthn) -> Result<Vec<u8>, HelloError> {
     let options = AuthenticatorDetailsOptions { version: 1 };
     let options_ptr = &options;
     let mut list: *const AuthenticatorDetailsList = std::ptr::null();
@@ -990,21 +926,12 @@ fn select_hello_authenticator(api: &WebAuthn) -> Result<HelloSelector, HelloErro
     let mut ids: Vec<Vec<u8>> = Vec::new();
     let mut locked = false;
     if !list.is_null() {
-        // SAFETY: a non-null list is a valid list until the free call.
+        // SAFETY: a non-null list stays valid, with `count` entry pointers, until the free call.
         let details = unsafe { &*list };
-        for index in 0..details.count {
-            // SAFETY: index is within the array length declared by count.
-            let entry_ptr = unsafe { *details.details.add(index as usize) };
-            if entry_ptr.is_null() {
-                continue;
-            }
-            // SAFETY: non-null entry pointer from the native list.
-            let entry = unsafe { &*entry_ptr };
-            let name = wide_to_string(entry.authenticator_name);
-            if !name
-                .as_deref()
-                .is_some_and(|n| n.eq_ignore_ascii_case(HELLO_NAME))
-            {
+        // SAFETY: as above.
+        for entry in unsafe { native_entries(details.count, details.details) } {
+            // SAFETY: entry strings are null or NUL-terminated while the list lives.
+            if !unsafe { from_wstr(entry.authenticator_name) }.eq_ignore_ascii_case(HELLO_NAME) {
                 continue;
             }
             if entry.cb_authenticator_id == 0 || entry.pb_authenticator_id.is_null() {
@@ -1033,15 +960,8 @@ fn select_hello_authenticator(api: &WebAuthn) -> Result<HelloSelector, HelloErro
             "Windows Hello authenticator not found in the WebAuthn authenticator enumeration"
                 .into(),
         )),
-        1 => {
-            if locked {
-                Err(HelloError::Locked)
-            } else {
-                Ok(HelloSelector {
-                    id: ids.into_iter().next().unwrap(),
-                })
-            }
-        }
+        1 if locked => Err(HelloError::Locked),
+        1 => Ok(ids.remove(0)),
         _ => Err(HelloError::Conflict(format!(
             "{} Windows Hello authenticators enumerated, expected one",
             ids.len()
@@ -1050,12 +970,7 @@ fn select_hello_authenticator(api: &WebAuthn) -> Result<HelloSelector, HelloErro
 }
 
 fn get_cancellation_id(api: &WebAuthn) -> Result<Guid, HelloError> {
-    let mut guid = Guid {
-        data1: 0,
-        data2: 0,
-        data3: 0,
-        data4: [0; 8],
-    };
+    let mut guid = zeroed();
     // SAFETY: the out pointer is a valid, writable GUID-sized struct.
     let hr = unsafe { (api.get_cancellation_id)(&mut guid) };
     if hr == S_OK {
@@ -1067,7 +982,7 @@ fn get_cancellation_id(api: &WebAuthn) -> Result<Guid, HelloError> {
 
 struct ListedCredential {
     credential_id: Vec<u8>,
-    rp_id: Option<String>,
+    rp_id: String,
     user_id: Option<Vec<u8>>,
 }
 
@@ -1090,16 +1005,10 @@ fn list_platform_credentials(
     }
     let mut entries = Vec::new();
     if !list.is_null() {
-        // SAFETY: a non-null list is a valid list until the free call.
+        // SAFETY: a non-null list stays valid, with `count` entry pointers, until the free call.
         let details = unsafe { &*list };
-        for index in 0..details.count {
-            // SAFETY: index is within the array length declared by count.
-            let entry_ptr = unsafe { *details.details.add(index as usize) };
-            if entry_ptr.is_null() {
-                continue;
-            }
-            // SAFETY: non-null entry pointer from the native list.
-            let entry = unsafe { &*entry_ptr };
+        // SAFETY: as above.
+        for entry in unsafe { native_entries(details.count, details.details) } {
             let credential_id = if entry.cb_credential_id > 0 && !entry.pb_credential_id.is_null() {
                 // SAFETY: count and pointer come from the native entry.
                 unsafe {
@@ -1113,10 +1022,10 @@ fn list_platform_credentials(
                 Vec::new()
             };
             let entry_rp_id = if entry.rp_information.is_null() {
-                None
+                String::new()
             } else {
-                // SAFETY: nested entity is valid while the list lives.
-                wide_to_string(unsafe { (*entry.rp_information).id })
+                // SAFETY: nested entities and their strings are valid while the list lives.
+                unsafe { from_wstr((*entry.rp_information).id) }
             };
             let entry_user_id = if entry.user_information.is_null() {
                 None
@@ -1161,43 +1070,30 @@ fn delete_created_credential(
     rp_id: &str,
     user_id: &[u8; 32],
 ) -> Result<(), HelloError> {
-    // Only the exact RP and user match is deleted, and no other credential is ever touched.
-    let entries = list_platform_credentials(api, rp_id)?;
-    for entry in entries.iter().filter(|entry| {
-        entry.rp_id.as_deref() == Some(rp_id)
-            && entry.user_id.as_deref() == Some(user_id.as_slice())
-            && !entry.credential_id.is_empty()
-    }) {
-        let id = &entry.credential_id;
-        delete_credential(api, id)?;
-        let after = list_platform_credentials(api, rp_id)?;
-        if after
-            .iter()
-            .any(|entry| entry.credential_id.as_slice() == id.as_slice())
-        {
-            return Err(HelloError::Platform(
-                "own credential still listed after cleanup deletion".into(),
-            ));
-        }
-    }
-    Ok(())
+    let ids = owned_credentials(api, rp_id, Some(user_id))?;
+    delete_verified(api, rp_id, &ids)
 }
 
-fn read_attestation(
-    attestation: &Attestation,
+/// # Safety
+/// `attestation` must point to a native attestation whose leading `version` field is readable.
+unsafe fn read_attestation(
+    attestation: *const Attestation,
 ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), HelloError> {
-    if attestation.version < ATTESTATION_VERSION_MIN {
+    // SAFETY: every attestation version begins with `dwVersion`, read without a whole-struct reference.
+    let version = unsafe { (*attestation).version };
+    if version < ATTESTATION_VERSION_MIN {
         return Err(HelloError::Corrupt(format!(
-            "attestation version {} is below the PRF-requiring version {ATTESTATION_VERSION_MIN}",
-            attestation.version
+            "attestation version {version} is below the mirrored version {ATTESTATION_VERSION_MIN}"
         )));
     }
+    // SAFETY: an attestation of at least the mirrored version carries every field of the layout.
+    let attestation = unsafe { &*attestation };
     if attestation.used_transport & TRANSPORT_INTERNAL == 0 {
         return Err(HelloError::Unsupported(
             "make credential did not use the internal Windows Hello transport".into(),
         ));
     }
-    if attestation.version >= 8 && attestation.transports & TRANSPORT_INTERNAL == 0 {
+    if attestation.transports & TRANSPORT_INTERNAL == 0 {
         return Err(HelloError::Unsupported(
             "attestation reports no internal Windows Hello transport".into(),
         ));
@@ -1217,16 +1113,21 @@ fn read_attestation(
     Ok((credential_id, key))
 }
 
-fn read_assertion(
-    assertion: &Assertion,
+/// # Safety
+/// `assertion` must point to a native assertion whose leading `version` field is readable.
+unsafe fn read_assertion(
+    assertion: *const Assertion,
     requested_id: &[u8],
 ) -> Result<Zeroizing<[u8; 32]>, HelloError> {
-    if assertion.version < ASSERTION_VERSION_MIN {
+    // SAFETY: every assertion version begins with `dwVersion`, read without a whole-struct reference.
+    let version = unsafe { (*assertion).version };
+    if version < ASSERTION_VERSION_MIN {
         return Err(HelloError::Corrupt(format!(
-            "assertion version {} is below the PRF-requiring version {ASSERTION_VERSION_MIN}",
-            assertion.version
+            "assertion version {version} is below the mirrored version {ASSERTION_VERSION_MIN}"
         )));
     }
+    // SAFETY: an assertion of at least the mirrored version carries every field of the layout.
+    let assertion = unsafe { &*assertion };
     if assertion.used_transport & TRANSPORT_INTERNAL == 0 {
         return Err(HelloError::Unsupported(
             "get assertion did not use the internal Windows Hello transport".into(),
@@ -1326,10 +1227,10 @@ fn build_client_data(
     let mut challenge = [0u8; 32];
     fill(&mut challenge)
         .map_err(|error| HelloError::Platform(format!("challenge randomness failed. {error}")))?;
+    // `rp_id` is lowercase hex plus `.invalid`, so it needs no JSON escaping.
     let json = format!(
-        "{{\"type\":\"webauthn.{operation}\",\"challenge\":\"{}\",\"origin\":\"https://{}\",\"crossOrigin\":false}}",
+        "{{\"type\":\"webauthn.{operation}\",\"challenge\":\"{}\",\"origin\":\"https://{rp_id}\",\"crossOrigin\":false}}",
         base64url(&challenge),
-        json_escape(rp_id),
     );
     let len = json.len();
     debug_assert!(len <= u32::MAX as usize, "client data json fits in a DWORD");
@@ -1361,16 +1262,13 @@ fn operation_error(
 }
 
 fn hr_error(api: &WebAuthn, hr: i32, operation: &str) -> HelloError {
-    HelloError::Platform(format!(
-        "{operation} failed with {} (0x{hr:08X})",
-        error_name(api, hr)
-    ))
-}
-
-fn error_name(api: &WebAuthn, hr: i32) -> String {
-    // SAFETY: the call takes an HRESULT and returns a static native string.
-    let ptr = unsafe { (api.get_error_name)(hr) };
-    wide_to_string(ptr).unwrap_or_else(|| "unknown".into())
+    let name = api
+        .get_error_name
+        // SAFETY: the export returns null or a static NUL-terminated string.
+        .map(|get_error_name| unsafe { from_wstr(get_error_name(hr)) })
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".into());
+    HelloError::Platform(format!("{operation} failed with {name} (0x{hr:08X})"))
 }
 
 fn timeout_ms(timeout: Duration) -> u32 {
@@ -1405,35 +1303,16 @@ fn base64url(input: &[u8]) -> String {
     out
 }
 
-fn json_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-fn wide_to_string(ptr: *const u16) -> Option<String> {
-    if ptr.is_null() {
-        return None;
-    }
-    let mut len = 0;
-    // SAFETY: the pointer is a native null-terminated wide string owned by
-    // the live native structure or by the webauthn.dll error table.
-    while unsafe { *ptr.add(len) } != 0 {
-        len += 1;
-    }
-    Some(String::from_utf16_lossy(unsafe {
-        std::slice::from_raw_parts(ptr, len)
-    }))
+/// Non-null entries of a native array of `count` entry pointers.
+///
+/// # Safety
+/// `details` must hold `count` pointers, each null or valid for `'a`.
+unsafe fn native_entries<'a, T: 'a>(
+    count: u32,
+    details: *const *const T,
+) -> impl Iterator<Item = &'a T> {
+    // SAFETY: the caller guarantees `count` readable pointers, each null or valid for `'a`.
+    (0..count as usize).filter_map(move |index| unsafe { (*details.add(index)).as_ref() })
 }
 
 #[cfg(test)]
@@ -1455,13 +1334,6 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_cancel_before_any_operation_only_sets_the_flag() {
-        let cancel = HelloCancellation::new();
-        cancel.cancel();
-        assert!(cancel.is_cancelled());
-    }
-
-    #[test]
     fn base64url_matches_rfc4648_url_alphabet_vectors() {
         assert_eq!(base64url(b""), "");
         assert_eq!(base64url(b"f"), "Zg");
@@ -1474,85 +1346,92 @@ mod tests {
     }
 
     #[test]
-    fn json_escape_handles_quotes_backslash_and_controls() {
-        assert_eq!(json_escape(r#"a"b\c"#), "a\\\"b\\\\c");
-        assert_eq!(json_escape("x\ny"), "x\\ny");
-        assert_eq!(json_escape("plain"), "plain");
-    }
-
-    #[test]
     fn attestation_without_prf_is_unsupported() {
-        // SAFETY: every field in the FFI record is an integer or nullable pointer.
-        let mut attestation: Attestation = unsafe { std::mem::zeroed() };
+        let mut attestation: Attestation = zeroed();
         attestation.version = ATTESTATION_VERSION_MIN;
         attestation.used_transport = TRANSPORT_INTERNAL;
         assert!(matches!(
-            read_attestation(&attestation),
+            // SAFETY: the fixture is a complete local attestation.
+            unsafe { read_attestation(&attestation) },
             Err(HelloError::Unsupported(_))
         ));
     }
 
-    fn test_attestation(data: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), HelloError> {
-        let credential_id = [9u8; 32];
-        let prf = [13u8; 32];
-        let salt = HmacSalt {
-            cb_first: HMAC_SECRET_LENGTH,
-            pb_first: prf.as_ptr(),
-            cb_second: 0,
-            pb_second: std::ptr::null(),
-        };
-        // SAFETY: every field in the FFI record is an integer or nullable pointer.
-        let mut attestation: Attestation = unsafe { std::mem::zeroed() };
-        attestation.version = 8;
+    const CREDENTIAL_ID: [u8; 32] = [9; 32];
+    const PRF: [u8; 32] = [13; 32];
+
+    fn test_attestation_version(
+        version: u32,
+        data: &[u8],
+    ) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), HelloError> {
+        let salt = prf_salt(&PRF);
+        let mut attestation: Attestation = zeroed();
+        attestation.version = version;
         attestation.used_transport = TRANSPORT_INTERNAL;
         attestation.transports = TRANSPORT_INTERNAL;
         attestation.prf_enabled = 1;
-        attestation.cb_credential_id = credential_id.len().try_into().unwrap();
-        attestation.pb_credential_id = credential_id.as_ptr();
+        attestation.cb_credential_id = CREDENTIAL_ID.len().try_into().unwrap();
+        attestation.pb_credential_id = CREDENTIAL_ID.as_ptr();
         attestation.cb_authenticator_data = data.len().try_into().unwrap();
         attestation.pb_authenticator_data = data.as_ptr();
         attestation.hmac_secret = &salt;
-        read_attestation(&attestation)
+        // SAFETY: the fixture is a complete local attestation.
+        unsafe { read_attestation(&attestation) }
     }
 
-    fn test_assertion(data: &[u8]) -> Result<Zeroizing<[u8; 32]>, HelloError> {
-        let credential_id = [9u8; 32];
-        let prf = [13u8; 32];
-        let salt = HmacSalt {
-            cb_first: HMAC_SECRET_LENGTH,
-            pb_first: prf.as_ptr(),
-            cb_second: 0,
-            pb_second: std::ptr::null(),
-        };
-        // SAFETY: every field in the FFI record is an integer or nullable pointer.
-        let mut assertion: Assertion = unsafe { std::mem::zeroed() };
-        assertion.version = 6;
+    fn test_attestation(data: &[u8]) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>), HelloError> {
+        test_attestation_version(8, data)
+    }
+
+    fn test_assertion_version(
+        version: u32,
+        data: &[u8],
+    ) -> Result<Zeroizing<[u8; 32]>, HelloError> {
+        let salt = prf_salt(&PRF);
+        let mut assertion: Assertion = zeroed();
+        assertion.version = version;
         assertion.used_transport = TRANSPORT_INTERNAL;
         assertion.credential = Credential {
             version: 1,
-            cb_id: credential_id.len().try_into().unwrap(),
-            pb_id: credential_id.as_ptr(),
+            cb_id: CREDENTIAL_ID.len().try_into().unwrap(),
+            pb_id: CREDENTIAL_ID.as_ptr(),
             credential_type: std::ptr::null(),
         };
         assertion.cb_authenticator_data = data.len().try_into().unwrap();
         assertion.pb_authenticator_data = data.as_ptr();
         assertion.hmac_secret = &salt;
-        read_assertion(&assertion, &credential_id)
+        // SAFETY: the fixture is a complete local assertion.
+        unsafe { read_assertion(&assertion, &CREDENTIAL_ID) }
+    }
+
+    fn test_assertion(data: &[u8]) -> Result<Zeroizing<[u8; 32]>, HelloError> {
+        test_assertion_version(6, data)
     }
 
     #[test]
-    fn attestation_accepts_extended_authenticator_data() {
+    fn ceremonies_reject_versions_below_the_mirrored_layouts() {
         let mut data = [0u8; 164];
         data[AUTHENTICATOR_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT | FLAG_USER_VERIFIED;
-        let (credential_id, _) = test_attestation(&data).unwrap();
-        assert_eq!(credential_id, [9u8; 32]);
+        assert!(matches!(
+            test_attestation_version(7, &data),
+            Err(HelloError::Corrupt(_))
+        ));
+        assert!(matches!(
+            test_assertion_version(5, &data),
+            Err(HelloError::Corrupt(_))
+        ));
     }
 
     #[test]
-    fn assertion_accepts_extended_authenticator_data() {
-        let mut data = [0u8; 75];
+    fn ceremonies_accept_extended_authenticator_data() {
+        let mut data = [0u8; 164];
         data[AUTHENTICATOR_DATA_FLAGS_OFFSET] = FLAG_USER_PRESENT | FLAG_USER_VERIFIED;
-        assert!(test_assertion(&data).is_ok());
+        let (credential_id, key) = test_attestation(&data).unwrap();
+        assert_eq!(
+            (credential_id.as_slice(), *key),
+            (CREDENTIAL_ID.as_slice(), PRF)
+        );
+        assert_eq!(*test_assertion(&data[..75]).unwrap(), PRF);
     }
 
     #[test]

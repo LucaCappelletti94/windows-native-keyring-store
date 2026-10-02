@@ -42,9 +42,9 @@ The gate requires Windows WebAuthn API `9` and explicitly selects Windows Hello 
 
 Missing credentials or metadata beside protected entries return key loss or corruption without replacing the credential. Only public credential ID, random user ID, and salt metadata persist outside encrypted entries.
 
-After an authenticated unlock, first access to an exact legacy `{user}.{service}` target seals the existing secret under its scoped target and persists it before deleting that source. Stop external legacy writers during migration.
+After an authenticated unlock, first access to an exact legacy `{user}.{service}` target seals the existing secret under its scoped target and persists it before deleting that source. Stop every other writer of that legacy target during migration, including plain `Store` entries in the same application.
 
-Participating library writers share a named cross-process mutex and recheck the source before deletion. Windows has no compare-and-delete credential API, so a nonparticipating writer racing that final deletion can lose its update.
+Hello stores serialize their writes and migrations through cross-process locks in a private namespace bound to the current Windows user, and recheck the source before deletion. Plain `Store` writes take no lock. Windows has no compare-and-delete credential API, so a writer racing that final deletion can lose its update.
 
 ## Search and threading
 
