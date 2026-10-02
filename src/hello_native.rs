@@ -910,6 +910,33 @@ pub(crate) fn remove_exact(rp_id: &str, credential_id: &[u8]) -> Result<(), Hell
     Ok(())
 }
 
+/// Deletes every platform credential listed under exactly `rp_id`, verifying their absence.
+///
+/// The RP identifier is derived from one store's identity, so it cannot match another store.
+pub(crate) fn remove_all_for_rp(rp_id: &str) -> Result<(), HelloError> {
+    let api = match load() {
+        Ok(api) => api,
+        // Enrollment requires this API, so no credential for the store can exist without it.
+        Err(HelloError::Unsupported(_)) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let owned = |entry: &ListedCredential| {
+        entry.rp_id.as_deref() == Some(rp_id) && !entry.credential_id.is_empty()
+    };
+    for entry in list_platform_credentials(&api, rp_id)?
+        .iter()
+        .filter(|entry| owned(entry))
+    {
+        delete_credential(&api, &entry.credential_id)?;
+    }
+    if list_platform_credentials(&api, rp_id)?.iter().any(owned) {
+        return Err(HelloError::Corrupt(
+            "store credential still listed after deletion".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_rp_entity(bufs: &mut NativeBuffers, rp_id: &str) -> RpEntity {
     RpEntity {
         version: 1,

@@ -41,6 +41,11 @@ impl HelloStore {
         self.gate.lock();
     }
 
+    /// Delete this store's entries, enrollment, and passkey, retiring every existing handle.
+    pub fn discard(&self, timeout: Duration) -> std::result::Result<(), HelloError> {
+        self.gate.discard(timeout)
+    }
+
     /// Report whether this store has an unlocked or lost key.
     pub fn protection(&self) -> Protection {
         self.gate.protection()

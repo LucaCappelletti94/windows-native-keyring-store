@@ -4,6 +4,42 @@ use keyring_core::{Error, api::CredentialStoreApi};
 
 use crate::{HelloStore, Store, hello::HelloError};
 
+struct ScopeCleanup {
+    prefix: String,
+    targets: Vec<String>,
+}
+
+impl ScopeCleanup {
+    fn new(store: &HelloStore) -> Self {
+        Self {
+            prefix: store.id(),
+            targets: Vec::new(),
+        }
+    }
+
+    fn track(&mut self, entry: &keyring_core::Entry) -> String {
+        let target = entry
+            .as_any()
+            .downcast_ref::<crate::cred::Cred>()
+            .unwrap()
+            .target_name
+            .clone();
+        self.targets.push(target.clone());
+        target
+    }
+}
+
+impl Drop for ScopeCleanup {
+    fn drop(&mut self) {
+        for target in &self.targets {
+            let _ = crate::utils::delete_credential(target);
+        }
+        for suffix in ["metadata", "control"] {
+            let _ = crate::utils::delete_credential(&format!("{}{suffix}", self.prefix));
+        }
+    }
+}
+
 #[test]
 fn named_store_refuses_plaintext_operations_while_locked() {
     let store = HelloStore::new("app", "account").unwrap();
@@ -137,10 +173,6 @@ fn failed_migration_preserves_the_original_credential() {
     let protected = protected_store.build(&application, &user, None).unwrap();
     protected_store.install_test_key([27; 32]);
     assert!(matches!(protected.get_secret(), Err(Error::TooLong(_, _))));
-    assert!(matches!(
-        protected.delete_credential(),
-        Err(Error::TooLong(_, _))
-    ));
     assert_eq!(legacy.get_secret().unwrap(), original);
     let target = &protected
         .as_any()
@@ -155,27 +187,29 @@ fn failed_migration_preserves_the_original_credential() {
 }
 
 #[test]
-fn deleting_a_scoped_entry_refuses_an_unmigrated_legacy_duplicate() {
+fn locked_delete_removes_both_exact_sources_without_decrypting() {
     let application = format!("test-{}", fastrand::u64(..));
     let user = format!("user-{}", fastrand::u64(..));
     let store = HelloStore::new(&application, "shared").unwrap();
+    let mut cleanup = ScopeCleanup::new(&store);
     store.install_test_key([44; 32]);
     let protected = store.build(&application, &user, None).unwrap();
+    let scoped_target = cleanup.track(&protected);
     protected.set_secret(b"sealed").unwrap();
+    store.lock();
 
     let legacy = Store::new()
         .unwrap()
         .build(&application, &user, None)
         .unwrap();
+    cleanup.track(&legacy);
     legacy.set_secret(b"independent").unwrap();
-    assert!(matches!(
-        protected.delete_credential(),
-        Err(Error::PlatformFailure(reason)) if matches!(reason.downcast_ref::<HelloError>(), Some(HelloError::Conflict(_)))
-    ));
-    assert_eq!(protected.get_secret().unwrap(), b"sealed");
-    assert_eq!(legacy.get_secret().unwrap(), b"independent");
-    legacy.delete_credential().unwrap();
     protected.delete_credential().unwrap();
+    assert!(matches!(legacy.get_secret(), Err(Error::NoEntry)));
+    assert!(matches!(
+        crate::utils::extract_from_credential(&scoped_target, crate::utils::extract_secret),
+        Err(Error::NoEntry)
+    ));
 }
 
 #[test]
@@ -286,4 +320,124 @@ fn migration_accepts_arbitrary_legacy_binary_secret() {
     assert_eq!(protected.get_secret().unwrap(), secret);
     assert!(matches!(ordinary.get_secret(), Err(Error::NoEntry)));
     protected.delete_credential().unwrap();
+}
+
+#[test]
+fn locked_delete_of_absent_entry_returns_no_entry() {
+    let application = format!("delete-{}", fastrand::u64(..));
+    let store = HelloStore::new(&application, "shared").unwrap();
+    let _cleanup = ScopeCleanup::new(&store);
+    let entry = store.build(&application, "absent", None).unwrap();
+    assert!(matches!(entry.delete_credential(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn discard_retires_old_handles_and_preserves_another_named_store() {
+    let application = format!("discard-{}", fastrand::u64(..));
+    let first = HelloStore::new(&application, "first").unwrap();
+    let second = HelloStore::new(&application, "second").unwrap();
+    let mut first_cleanup = ScopeCleanup::new(&first);
+    let mut second_cleanup = ScopeCleanup::new(&second);
+    first.install_test_key([12; 32]);
+    second.install_test_key([13; 32]);
+    let old = first.build(&application, "item", None).unwrap();
+    let neighbor = second.build(&application, "item", None).unwrap();
+    let first_target = first_cleanup.track(&old);
+    second_cleanup.track(&neighbor);
+    old.set_secret(b"first").unwrap();
+    neighbor.set_secret(b"second").unwrap();
+
+    first.discard(std::time::Duration::from_secs(5)).unwrap();
+    assert!(matches!(
+        crate::utils::extract_from_credential(&first_target, crate::utils::extract_secret),
+        Err(Error::NoEntry)
+    ));
+    assert_eq!(neighbor.get_secret().unwrap(), b"second");
+
+    let fresh = HelloStore::new(&application, "first").unwrap();
+    fresh.install_test_key([17; 32]);
+    let replacement = fresh.build(&application, "item", None).unwrap();
+    replacement.set_secret(b"replacement").unwrap();
+    assert!(matches!(
+        old.set_secret(b"stale"),
+        Err(Error::NoStorageAccess(_))
+    ));
+    assert!(matches!(
+        old.delete_credential(),
+        Err(Error::NoStorageAccess(_))
+    ));
+    assert_eq!(replacement.get_secret().unwrap(), b"replacement");
+}
+
+fn write_raw(target: &str, bytes: &[u8]) {
+    crate::utils::save_credential(target, "", "", "", bytes, &crate::CredPersist::Local).unwrap();
+}
+
+fn refused_with(result: keyring_core::Result<()>, expected: &HelloError) -> bool {
+    matches!(
+        result,
+        Err(Error::NoStorageAccess(reason)) if reason.downcast_ref::<HelloError>() == Some(expected)
+    )
+}
+
+#[test]
+fn discard_recovers_from_corrupt_enrollment_metadata() {
+    let application = format!("discard-{}", fastrand::u64(..));
+    let store = HelloStore::new(&application, "metadata").unwrap();
+    let mut cleanup = ScopeCleanup::new(&store);
+    store.install_test_key([21; 32]);
+    let entry = store.build(&application, "item", None).unwrap();
+    let target = cleanup.track(&entry);
+    entry.set_secret(b"sealed").unwrap();
+    let metadata = format!("{}metadata", store.id());
+    write_raw(&metadata, b"not enrollment metadata");
+
+    store.discard(std::time::Duration::from_secs(5)).unwrap();
+    for removed in [&target, &metadata] {
+        assert!(matches!(
+            crate::utils::extract_from_credential(removed, crate::utils::extract_secret),
+            Err(Error::NoEntry)
+        ));
+    }
+}
+
+#[test]
+fn corrupt_control_record_opens_blocked_until_discard() {
+    let application = format!("discard-{}", fastrand::u64(..));
+    let neighbor = HelloStore::new(&application, "neighbor").unwrap();
+    let mut neighbor_cleanup = ScopeCleanup::new(&neighbor);
+    neighbor.install_test_key([31; 32]);
+    let kept = neighbor.build(&application, "item", None).unwrap();
+    neighbor_cleanup.track(&kept);
+    kept.set_secret(b"kept").unwrap();
+
+    let mut cleanup = ScopeCleanup::new(&HelloStore::new(&application, "control").unwrap());
+    write_raw(
+        &format!("{}control", cleanup.prefix),
+        b"not a control record",
+    );
+    let blocked = HelloStore::new(&application, "control").unwrap();
+    blocked.install_test_key([32; 32]);
+    let entry = blocked.build(&application, "item", None).unwrap();
+    cleanup.track(&entry);
+    assert!(refused_with(
+        entry.set_secret(b"secret"),
+        &HelloError::Discarding
+    ));
+    assert!(refused_with(
+        entry.delete_credential(),
+        &HelloError::Discarding
+    ));
+
+    blocked.discard(std::time::Duration::from_secs(5)).unwrap();
+    assert!(refused_with(
+        entry.set_secret(b"stale"),
+        &HelloError::Discarded
+    ));
+    let fresh = HelloStore::new(&application, "control").unwrap();
+    fresh.install_test_key([33; 32]);
+    let replacement = fresh.build(&application, "item", None).unwrap();
+    replacement.set_secret(b"replacement").unwrap();
+    assert_eq!(replacement.get_secret().unwrap(), b"replacement");
+    assert_eq!(kept.get_secret().unwrap(), b"kept");
 }

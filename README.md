@@ -18,6 +18,10 @@ The first `unlock` enrolls a credential with one Windows Hello approval. Later u
 
 Supply a fresh `HelloCancellation` for each request and a bounded timeout. `lock` cancels a pending request and erases the shared sealing key. Dropping the store also locks retained entry handles.
 
+Deleting an entry never prompts and works while locked or after key loss. It removes the exact legacy `{user}.{service}` target first, then the scoped target, and reports a partial deletion if only the first succeeds.
+
+`discard(timeout)` destroys one named store after cancelling its pending request. It removes the store's passkey, scoped entries, and enrollment metadata, then retires every existing handle. An incomplete discard or unreadable store control record keeps the store blocked until a `discard` finishes. Stop external writers first.
+
 ```rust
 use keyring_core::api::CredentialStoreApi;
 use std::{sync::Arc, time::Duration};

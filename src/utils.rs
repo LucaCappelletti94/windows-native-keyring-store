@@ -349,6 +349,12 @@ pub fn extract_attributes(credential: &CREDENTIALW) -> Result<HashMap<String, St
     Ok(result)
 }
 
+/// The target name of a credential returned by `CredReadW` or `CredEnumerateW`.
+pub(crate) fn target_name(credential: &CREDENTIALW) -> String {
+    // SAFETY: Credential Manager returns a NUL-terminated `TargetName` valid while `credential` lives.
+    unsafe { from_wstr(credential.TargetName) }
+}
+
 /// helper for extract_from_platform
 fn erase_secret(credential: &mut CREDENTIALW) {
     let blob_pointer: *mut u8 = credential.CredentialBlob;
