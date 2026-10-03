@@ -20,11 +20,14 @@ search = ["dep:regex"]
 keyring-core = { version = "1" }
 byteorder = "1"
 regex = { version = "1", optional = true }
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials"] }
+parking_lot = "0.12"
+thiserror = "2"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Credentials", "Win32_Security_Cryptography", "Win32_System_Threading"] }
 zeroize = "1"
 
 [dev-dependencies]
 fastrand = "2"
+p256 = { version = "0.13", features = ["ecdsa"] }
 sscanf = "0.5"
 
 [package.metadata.docs.rs]
