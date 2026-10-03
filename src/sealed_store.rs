@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use keyring_core::api::{CredentialPersistence, CredentialStoreApi};
 use keyring_core::{Entry, Result};
@@ -30,8 +31,9 @@ impl SealedStore {
     ///
     /// # Errors
     ///
-    /// [`SealError::WrongKey`] if `key` is not the store's key, and [`SealError::Corrupt`] if
-    /// the store's key record is unreadable or missing while entries exist.
+    /// [`SealError::WrongKey`] if `key` is not the store's key, [`SealError::Corrupt`] if
+    /// the store's key record is unreadable or missing while entries exist, and
+    /// [`SealError::Discarding`] or [`SealError::Discarded`] around a discard.
     pub fn unlock(&self, key: &[u8; 32]) -> std::result::Result<(), SealError> {
         self.gate.unlock(key)
     }
@@ -44,6 +46,23 @@ impl SealedStore {
     /// Report whether this store holds its key.
     pub fn protection(&self) -> Protection {
         self.gate.protection()
+    }
+
+    /// Delete every entry and the key record, retiring every existing handle of this store.
+    ///
+    /// It holds the store's cross-process lock from start to end. Meanwhile an unlock or an
+    /// operation on a stored entry waits up to 30 seconds for that lock and then fails with
+    /// [`SealError::TimedOut`], and another `discard` waits at most its own `timeout`.
+    /// [`SealedStore::protection`] and [`SealedStore::lock`] never wait for that lock, but
+    /// they do wait for an entry operation already running through this handle. An
+    /// interrupted discard blocks the store until any handle runs `discard` again.
+    ///
+    /// # Errors
+    ///
+    /// [`SealError::TimedOut`] if the store's lock is not free within `timeout`, and
+    /// [`SealError::Discarded`] if this handle predates an earlier discard.
+    pub fn discard(&self, timeout: Duration) -> std::result::Result<(), SealError> {
+        self.gate.discard(timeout)
     }
 }
 
