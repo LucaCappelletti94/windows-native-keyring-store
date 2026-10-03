@@ -25,4 +25,4 @@ jobs:
         with:
           tool: cargo-mutants
       - run: git diff origin/$env:GITHUB_BASE_REF...HEAD > pr.diff
-      - run: cargo mutants --in-diff pr.diff -- -- --test-threads 1
+      - run: cargo mutants --in-diff pr.diff --cap-lints true -- -- --test-threads 1
