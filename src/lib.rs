@@ -89,7 +89,7 @@ entry.set_password("refresh-token")?;
 assert_eq!(entry.get_password()?, "refresh-token");
 store.lock();
 assert!(entry.get_password().is_err());
-entry.delete_credential()?;
+store.discard(std::time::Duration::from_secs(10))?;
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -99,6 +99,10 @@ The first unlock of an empty store writes a key record, and later unlocks with a
 other key fail with [SealError::WrongKey]. Reads and writes fail with
 `NoStorageAccess` while the store is locked, and deleting an entry needs no key.
 A plain [Store] refuses to read a sealed secret as a password.
+
+[SealedStore::discard] deletes a store's entries and key record without its key,
+and every existing handle of that store then fails with [SealError::Discarded].
+Opening the store again gives an empty store whose first unlock records a new key.
 
 ## Warnings
 

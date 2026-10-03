@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use keyring_core::{Entry, Error, api::CredentialStoreApi};
 
@@ -23,22 +24,31 @@ fn write_raw(target: &str, bytes: &[u8]) {
 /// A store with a fresh name whose records are deleted when the test ends.
 struct Scope {
     application: String,
+    name: String,
     store: Arc<SealedStore>,
     targets: Vec<String>,
 }
 
 impl Scope {
     fn new() -> Self {
-        let application = format!("sealed-test-{}", fastrand::u64(..));
+        Self::named(format!("sealed-test-{}", fastrand::u64(..)), "store")
+    }
+
+    fn named(application: String, name: &str) -> Self {
         Self {
-            store: SealedStore::new(&application, "store").unwrap(),
+            store: SealedStore::new(&application, name).unwrap(),
             application,
+            name: name.into(),
             targets: Vec::new(),
         }
     }
 
+    fn sibling(&self, name: &str) -> Self {
+        Self::named(self.application.clone(), name)
+    }
+
     fn reopen(&self) -> Arc<SealedStore> {
-        SealedStore::new(&self.application, "store").unwrap()
+        SealedStore::new(&self.application, &self.name).unwrap()
     }
 
     fn entry(&mut self, user: &str) -> Entry {
@@ -50,11 +60,19 @@ impl Scope {
     fn keycheck(&self) -> String {
         format!("{}keycheck", self.store.id())
     }
+
+    fn control(&self) -> String {
+        format!("{}control", self.store.id())
+    }
 }
 
 impl Drop for Scope {
     fn drop(&mut self) {
-        for target in self.targets.iter().chain([&self.keycheck()]) {
+        for target in self
+            .targets
+            .iter()
+            .chain([&self.keycheck(), &self.control()])
+        {
             let _ = delete_credential(target);
         }
     }
@@ -294,7 +312,13 @@ fn seal_errors_map_to_keyring_error_kinds() {
         Error::from(SealError::Platform("service".into())),
         Error::PlatformFailure(_)
     ));
-    for error in [SealError::Locked, SealError::WrongKey, SealError::TimedOut] {
+    for error in [
+        SealError::Locked,
+        SealError::WrongKey,
+        SealError::TimedOut,
+        SealError::Discarding,
+        SealError::Discarded,
+    ] {
         assert!(matches!(Error::from(error), Error::NoStorageAccess(_)));
     }
 }
@@ -352,4 +376,133 @@ fn a_second_process_shares_the_store_and_its_locks() {
     assert!(child(format!("held:{}", scope.application)));
     drop(probe);
     assert!(child(format!("free:{}", scope.application)));
+}
+
+const DISCARD_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[test]
+fn discard_retires_every_handle_and_spares_a_sibling_store() {
+    let mut scope = Scope::new();
+    let mut sibling = scope.sibling("other");
+    scope.store.unlock(&[21; 32]).unwrap();
+    sibling.store.unlock(&[21; 32]).unwrap();
+    let entry = scope.entry("user");
+    entry.set_secret(b"discarded").unwrap();
+    let kept = sibling.entry("user");
+    kept.set_secret(b"kept").unwrap();
+    let second = scope.reopen();
+    second.unlock(&[21; 32]).unwrap();
+    let second_entry = second.build("service", "user", None).unwrap();
+
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+
+    assert_eq!(scope.store.protection(), Protection::Locked);
+    assert!(refused_with(entry.get_secret(), &SealError::Discarded));
+    assert!(refused_with(
+        second_entry.get_secret(),
+        &SealError::Discarded
+    ));
+    assert!(refused_with(
+        second_entry.delete_credential(),
+        &SealError::Discarded
+    ));
+    assert_eq!(second.unlock(&[21; 32]), Err(SealError::Discarded));
+    assert_eq!(
+        scope.store.discard(DISCARD_TIMEOUT),
+        Err(SealError::Discarded)
+    );
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.keycheck()), Err(Error::NoEntry)));
+    assert_eq!(kept.get_secret().unwrap(), b"kept");
+
+    let fresh = scope.reopen();
+    fresh.unlock(&[22; 32]).unwrap();
+    let reborn = fresh.build("service", "user", None).unwrap();
+    assert!(matches!(reborn.get_secret(), Err(Error::NoEntry)));
+    reborn.set_secret(b"second generation").unwrap();
+
+    scope.reopen().discard(DISCARD_TIMEOUT).unwrap();
+    assert!(refused_with(reborn.get_secret(), &SealError::Discarded));
+}
+
+#[test]
+fn discard_waits_for_a_briefly_held_store_lock() {
+    let scope = Scope::new();
+    let control = scope.control();
+    let (held, release) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let _lock = crate::sealed_lock::lock_target(&control).unwrap();
+        held.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+    });
+    release.recv().unwrap();
+    assert_eq!(scope.store.discard(DISCARD_TIMEOUT), Ok(()));
+    holder.join().unwrap();
+}
+
+#[test]
+fn corrupt_control_record_blocks_the_store_until_discard() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[23; 32]).unwrap();
+    let entry = scope.entry("user");
+    entry.set_secret(b"sealed").unwrap();
+    write_raw(&scope.control(), b"garbage");
+
+    let blocked = scope.reopen();
+    assert_eq!(blocked.unlock(&[23; 32]), Err(SealError::Discarding));
+    assert!(refused_with(entry.get_secret(), &SealError::Discarding));
+    blocked.discard(DISCARD_TIMEOUT).unwrap();
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    scope.reopen().unlock(&[24; 32]).unwrap();
+}
+
+#[test]
+fn an_interrupted_discard_blocks_until_any_handle_resumes_it() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[25; 32]).unwrap();
+    let entry = scope.entry("user");
+    entry.set_secret(b"sealed").unwrap();
+    let mut marker = crate::sealed::CONTROL_MAGIC.to_vec();
+    marker.push(1);
+    marker.extend([7; 16]);
+    write_raw(&scope.control(), &marker);
+
+    assert!(refused_with(
+        entry.set_secret(b"replacement"),
+        &SealError::Discarding
+    ));
+    assert!(refused_with(
+        entry.delete_credential(),
+        &SealError::Discarding
+    ));
+    assert_eq!(scope.store.unlock(&[25; 32]), Err(SealError::Discarding));
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.keycheck()), Err(Error::NoEntry)));
+    scope.reopen().unlock(&[26; 32]).unwrap();
+}
+
+#[test]
+fn discard_gives_up_when_the_store_lock_stays_held() {
+    let scope = Scope::new();
+    let _held = crate::sealed_lock::lock_target(&scope.control()).unwrap();
+    let store = Arc::clone(&scope.store);
+    let result = std::thread::spawn(move || store.discard(Duration::from_millis(200)))
+        .join()
+        .unwrap();
+    assert_eq!(result, Err(SealError::TimedOut));
+}
+
+#[test]
+fn a_deleted_control_record_never_revives_a_retired_generation() {
+    let mut scope = Scope::new();
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+    let current = scope.reopen();
+    current.unlock(&[27; 32]).unwrap();
+    let entry = current.build("service", "user", None).unwrap();
+    scope.targets.push(target_of(&entry));
+    delete_credential(&scope.control()).unwrap();
+
+    assert!(refused_with(entry.get_secret(), &SealError::Discarded));
+    assert_eq!(current.discard(DISCARD_TIMEOUT), Err(SealError::Discarded));
 }
