@@ -494,3 +494,16 @@ fn test_store_persistence() {
         CredentialPersistence::UntilDelete
     ));
 }
+
+#[test]
+fn ordinary_binary_secret_with_protected_prefix_remains_readable() {
+    let entry = entry_new("binary-secret", &generate_random_string());
+    let secret = b"\xff\xff\x01binary";
+    entry.set_secret(secret).unwrap();
+    assert_eq!(entry.get_secret().unwrap(), secret);
+    assert!(matches!(
+        entry.get_password(),
+        Err(Error::BadStoreFormat(_))
+    ));
+    entry.delete_credential().unwrap();
+}
