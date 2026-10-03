@@ -1517,7 +1517,7 @@ mod tests {
         let cancel = HelloCancellation::new();
         let error = match enroll(
             owner,
-            "connetto-hello-native-test.invalid",
+            TEST_RP_ID,
             &[7; 32],
             &[9; 32],
             &cancel,
@@ -1541,7 +1541,7 @@ mod tests {
         cancel.cancel();
         let error = match enroll(
             owner,
-            "connetto-hello-native-test.invalid",
+            TEST_RP_ID,
             &[7; 32],
             &[9; 32],
             &cancel,
@@ -1590,11 +1590,20 @@ mod tests {
     }
 
     #[cfg(windows)]
+    const TEST_RP_ID: &str = "windows-native-keyring-store-test.invalid";
+
+    #[cfg(windows)]
     #[test]
     fn recover_created_for_unknown_rp_and_user_is_none() {
         let mut user = [0u8; 32];
         fill(&mut user).expect("test randomness available");
-        let found = recover_created("connetto-hello-native-test.invalid", &user).unwrap();
+        let found = match recover_created(TEST_RP_ID, &user) {
+            Err(HelloError::Unsupported(reason)) => {
+                eprintln!("skipped on this host. {reason}");
+                return;
+            }
+            result => result.unwrap(),
+        };
         assert!(found.is_none());
     }
 }
