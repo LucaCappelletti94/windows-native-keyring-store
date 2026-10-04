@@ -269,6 +269,7 @@ pub fn cred_from_credential(credential: &mut CREDENTIALW) -> Cred {
         target_name,
         specifiers: None,
         persistence,
+        sealed: None,
     }
 }
 
@@ -343,6 +344,12 @@ pub fn extract_attributes(credential: &CREDENTIALW) -> Result<HashMap<String, St
         ),
     ]);
     Ok(result)
+}
+
+/// The target name of a credential returned by `CredReadW` or `CredEnumerateW`.
+pub(crate) fn target_name(credential: &CREDENTIALW) -> String {
+    // SAFETY: Credential Manager returns a NUL-terminated `TargetName` valid while `credential` lives.
+    unsafe { from_wstr(credential.TargetName) }
 }
 
 /// Lowercase hexadecimal encoding of `bytes`.
