@@ -193,6 +193,44 @@ pub(crate) fn save_spelled_credential(
     )
 }
 
+/// The `{user}.{service}` spelling a sealed record keeps in its attributes, if it has a whole one.
+#[cfg(feature = "search")]
+pub(crate) fn spelling(credential: &CREDENTIALW) -> Option<String> {
+    let mut chunks: Vec<(usize, &[u8])> = Vec::new();
+    for index in 0..credential.AttributeCount as usize {
+        // SAFETY: Credential Manager returns `AttributeCount` attributes valid while `credential` lives.
+        let attribute = unsafe { &*credential.Attributes.add(index) };
+        // SAFETY: every returned attribute has a NUL-terminated keyword.
+        let keyword = unsafe { from_wstr(attribute.Keyword) };
+        let Some(position) = keyword.strip_prefix(SPELLING_KEYWORD) else {
+            continue;
+        };
+        let value = if attribute.ValueSize == 0 {
+            &[][..]
+        } else {
+            // SAFETY: the attribute's value holds `ValueSize` bytes while `credential` lives.
+            unsafe { std::slice::from_raw_parts(attribute.Value, attribute.ValueSize as usize) }
+        };
+        chunks.push((position.parse().ok()?, value));
+    }
+    chunks.sort_unstable_by_key(|&(position, _)| position);
+    if chunks.is_empty()
+        || chunks
+            .iter()
+            .enumerate()
+            .any(|(expected, &(position, _))| expected != position)
+    {
+        return None;
+    }
+    String::from_utf8(
+        chunks
+            .into_iter()
+            .flat_map(|(_, value)| value.iter().copied())
+            .collect(),
+    )
+    .ok()
+}
+
 fn write_credential(
     target_name: &str,
     user: &str,
