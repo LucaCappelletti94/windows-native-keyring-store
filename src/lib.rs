@@ -120,6 +120,32 @@ match hello::capability() {
 }
 ```
 
+A [HelloStore] takes its key from the WebAuthn PRF extension of one Windows Hello passkey
+per store instead. The first unlock of an empty store enrolls the passkey, and every unlock
+asks for one Windows Hello approval, anchored to a live window of the application:
+
+```
+use std::sync::Arc;
+use std::time::Duration;
+
+use keyring_core::api::CredentialStoreApi;
+use windows_native_keyring_store::HelloStore;
+use windows_native_keyring_store::hello::{HelloCancellation, HelloWindow};
+
+fn save_token(window: Arc<dyn HelloWindow>) -> Result<(), Box<dyn std::error::Error>> {
+    let store = HelloStore::new("example-app", "tokens")?;
+    store.unlock(window, &HelloCancellation::new(), Duration::from_secs(120))?;
+    store.build("example-app", "alice", None)?.set_password("refresh-token")?;
+    store.lock();
+    Ok(())
+}
+```
+
+Its targets never collide with a [SealedStore] of the same names.
+[HelloStore::discard] needs no approval and also removes the passkey.
+If the passkey is gone while entries remain, unlock fails with [SealError::KeyLost],
+and only `discard` can reset the store.
+
 ## Warnings
 
 Tests show that operating on the same entry from different threads
@@ -139,7 +165,10 @@ threads.
 pub mod cred;
 pub use cred::CredPersist;
 pub mod hello;
+pub use hello::HelloStore;
 mod hello_native;
+#[cfg(test)]
+mod hello_tests;
 #[cfg(test)]
 mod pause;
 pub mod sealed;

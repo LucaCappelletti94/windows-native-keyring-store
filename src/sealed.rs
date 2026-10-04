@@ -87,6 +87,8 @@ pub enum Protection {
     Locked,
     /// The key is held until `lock` or drop.
     Unlocked,
+    /// The store's Windows Hello passkey was lost, so only `discard` can proceed.
+    Lost,
 }
 
 const MAX_PROTECTED_PLAINTEXT: usize = CRED_MAX_CREDENTIAL_BLOB_SIZE as usize - PROTECTED_OVERHEAD;
@@ -94,31 +96,51 @@ pub(crate) const CONTROL_MAGIC: &[u8; 5] = b"SCTL1";
 
 /// The store's discard state, which retires every handle that saw another generation.
 #[derive(Clone, Copy)]
-struct Control {
+pub(crate) struct Control {
     discarding: bool,
     generation: [u8; 16],
 }
 
-/// Scoped targets, keycheck and key of one sealed store, shared by its entries.
+/// Which store owns a gate, fixing its target prefix and whether it keeps a keycheck record.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Sealed,
+    Hello,
+}
+
+/// The key and the facts that decide whether it may be published.
+struct KeyState {
+    key: Option<Zeroizing<[u8; 32]>>,
+    // Bumped by `lock`, so a request that started earlier cannot publish.
+    epoch: u64,
+    lost: bool,
+}
+
+/// Scoped targets, control record and key of one sealed store, shared by its entries.
 pub(crate) struct Gate {
     prefix: String,
     generation: Option<[u8; 16]>,
-    key: Mutex<Option<Zeroizing<[u8; 32]>>>,
+    state: Mutex<KeyState>,
 }
 
 impl Gate {
-    pub(crate) fn new(application: &str, store: &str) -> Result<Arc<Self>> {
+    pub(crate) fn new(kind: Kind, application: &str, store: &str) -> Result<Arc<Self>> {
         if application.is_empty() || store.is_empty() {
             return Err(Error::Invalid(
                 "application/store".into(),
                 "identifiers cannot be empty".into(),
             ));
         }
-        let mut prefix = "keyring:sealed:1:".to_owned();
+        let mut prefix = match kind {
+            Kind::Sealed => "keyring:sealed:1:",
+            Kind::Hello => "keyring:hello-prf:1:",
+        }
+        .to_owned();
         for identifier in [application, store] {
             prefix += &format!("{:x}:{}:", identifier.len(), hex(identifier.as_bytes()));
         }
         validate_target(&format!("{prefix}keycheck"), "")?;
+        validate_target(&format!("{prefix}metadata"), "")?;
         let generation = match read_control(&format!("{prefix}control")) {
             Ok(control) => control.map(|control| control.generation),
             // An unreadable record opens blocked, so only `discard` can proceed.
@@ -128,7 +150,11 @@ impl Gate {
         Ok(Arc::new(Self {
             prefix,
             generation,
-            key: Mutex::new(None),
+            state: Mutex::new(KeyState {
+                key: None,
+                epoch: 0,
+                lost: false,
+            }),
         }))
     }
 
@@ -137,7 +163,10 @@ impl Gate {
     }
 
     pub(crate) fn protection(&self) -> Protection {
-        if unpoison(self.key.lock()).is_some() {
+        let state = unpoison(self.state.lock());
+        if state.lost {
+            Protection::Lost
+        } else if state.key.is_some() {
             Protection::Unlocked
         } else {
             Protection::Locked
@@ -186,11 +215,15 @@ impl Gate {
         format!("{}keycheck", self.prefix)
     }
 
-    fn control_target(&self) -> String {
+    pub(crate) fn control_target(&self) -> String {
         format!("{}control", self.prefix)
     }
 
-    fn check_control(&self) -> SealResult<()> {
+    pub(crate) fn metadata_target(&self) -> String {
+        format!("{}metadata", self.prefix)
+    }
+
+    pub(crate) fn check_control(&self) -> SealResult<()> {
         let control = match read_control(&self.control_target()) {
             Ok(control) => control,
             Err(SealError::Corrupt(_)) => return Err(SealError::Discarding),
@@ -214,9 +247,45 @@ impl Gate {
         action()
     }
 
-    /// Erases the key, so entries stay sealed until the next unlock.
+    /// Erases the key and retires every request started before this call.
     pub(crate) fn lock(&self) {
-        *unpoison(self.key.lock()) = None;
+        let mut state = unpoison(self.state.lock());
+        state.key = None;
+        state.epoch += 1;
+    }
+
+    /// The publication epoch a request must present to `settle`.
+    pub(crate) fn epoch(&self) -> u64 {
+        unpoison(self.state.lock()).epoch
+    }
+
+    /// Publishes a request's key unless `lock` ran since `epoch`, marking the store lost on loss.
+    pub(crate) fn settle(
+        &self,
+        epoch: u64,
+        result: SealResult<Zeroizing<[u8; 32]>>,
+    ) -> SealResult<()> {
+        let mut state = unpoison(self.state.lock());
+        if state.epoch != epoch {
+            return Err(SealError::Cancelled);
+        }
+        match result {
+            Ok(key) => {
+                state.key = Some(key);
+                Ok(())
+            }
+            Err(error) => {
+                if matches!(error, SealError::KeyLost | SealError::Corrupt(_)) {
+                    state.lost = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn install_key(&self, key: [u8; 32]) {
+        unpoison(self.state.lock()).key = Some(Zeroizing::new(key));
     }
 
     /// Verifies `key` against the keycheck record, writing it for a new store, then holds it.
@@ -241,7 +310,7 @@ impl Gate {
                         .map_err(platform)?;
                 }
             }
-            *unpoison(self.key.lock()) = Some(Zeroizing::new(*key));
+            unpoison(self.state.lock()).key = Some(Zeroizing::new(*key));
             Ok(())
         })
     }
@@ -250,27 +319,30 @@ impl Gate {
     pub(crate) fn discard(&self, timeout: Duration) -> SealResult<()> {
         #[cfg(test)]
         crate::pause::reached(&self.prefix, "discard.entered")?;
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(SealError::TimedOut)?;
+        let deadline = deadline(timeout)?;
         // One transaction, so no discarder or writer acts between the marker and the new generation.
         let _store = lock_target_with_timeout(&self.control_target(), remaining(deadline))?;
         self.mark_discarding()?;
         self.lock();
         #[cfg(test)]
         crate::pause::reached(&self.prefix, "discard.deleting")?;
-        for target in self.scoped_targets()? {
-            delete_owned(&target)?;
-        }
-        delete_owned(&self.keycheck_target())?;
+        self.delete_entries()?;
         self.publish_generation()
     }
 
+    /// Deletes every scoped entry, then the keycheck record.
+    pub(crate) fn delete_entries(&self) -> SealResult<()> {
+        for target in self.scoped_targets()? {
+            delete_owned(&target)?;
+        }
+        delete_owned(&self.keycheck_target())
+    }
+
     /// Persists the discard marker, or keeps an interrupted one, under the caller's control lock.
-    fn mark_discarding(&self) -> SealResult<()> {
+    pub(crate) fn mark_discarding(&self) -> SealResult<Control> {
         let control_target = self.control_target();
         let marker = match read_control(&control_target) {
-            Ok(Some(control)) if control.discarding => return Ok(()),
+            Ok(Some(control)) if control.discarding => return Ok(control),
             Ok(Some(control)) if Some(control.generation) == self.generation => Control {
                 discarding: true,
                 ..control
@@ -287,11 +359,27 @@ impl Gate {
             Ok(_) => return Err(SealError::Discarded),
             Err(error) => return Err(error),
         };
-        save_control(&control_target, &marker)
+        save_control(&control_target, &marker)?;
+        Ok(marker)
+    }
+
+    /// Whether `marker` is still the recorded discard, under the caller's control lock.
+    ///
+    /// Another record means another handle finished this discard. A missing or unreadable one is
+    /// marked again, since the caller is about to delete everything anyway.
+    pub(crate) fn still_discarding(&self, marker: &Control) -> SealResult<bool> {
+        match read_control(&self.control_target()) {
+            Ok(Some(control)) => Ok(control.discarding && control.generation == marker.generation),
+            Ok(None) | Err(SealError::Corrupt(_)) => {
+                save_control(&self.control_target(), marker)?;
+                Ok(true)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Ends a discard with a fresh generation, under the caller's control lock.
-    fn publish_generation(&self) -> SealResult<()> {
+    pub(crate) fn publish_generation(&self) -> SealResult<()> {
         save_control(
             &self.control_target(),
             &Control {
@@ -338,14 +426,19 @@ impl Gate {
         Ok(targets)
     }
 
-    fn has_scoped_entries(&self) -> SealResult<bool> {
+    pub(crate) fn has_scoped_entries(&self) -> SealResult<bool> {
         Ok(!self.scoped_targets()?.is_empty())
     }
 
     fn with_key<T>(&self, action: impl FnOnce(&[u8; 32]) -> Result<T>) -> Result<T> {
         self.guarded(|| {
-            let key = unpoison(self.key.lock());
-            action(key.as_ref().ok_or(SealError::Locked)?)
+            let state = unpoison(self.state.lock());
+            let key = state.key.as_ref().ok_or(if state.lost {
+                SealError::KeyLost
+            } else {
+                SealError::Locked
+            })?;
+            action(key)
         })
     }
 
@@ -417,7 +510,7 @@ impl Gate {
     }
 }
 
-fn read_raw(target: &str) -> SealResult<Option<Zeroizing<Vec<u8>>>> {
+pub(crate) fn read_raw(target: &str) -> SealResult<Option<Zeroizing<Vec<u8>>>> {
     match extract_from_credential(target, extract_secret) {
         Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
         Err(Error::NoEntry) => Ok(None),
@@ -425,11 +518,18 @@ fn read_raw(target: &str) -> SealResult<Option<Zeroizing<Vec<u8>>>> {
     }
 }
 
-fn platform(error: impl std::fmt::Display) -> SealError {
+pub(crate) fn platform(error: impl std::fmt::Display) -> SealError {
     SealError::Platform(error.to_string())
 }
 
-fn remaining(deadline: Instant) -> Duration {
+/// The instant `timeout` from now, refusing a timeout too large to represent.
+pub(crate) fn deadline(timeout: Duration) -> SealResult<Instant> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(SealError::TimedOut)
+}
+
+pub(crate) fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
@@ -468,7 +568,7 @@ fn random_generation() -> SealResult<[u8; 16]> {
     Ok(generation)
 }
 
-fn delete_owned(target: &str) -> SealResult<()> {
+pub(crate) fn delete_owned(target: &str) -> SealResult<()> {
     match delete_credential(target) {
         Ok(()) | Err(Error::NoEntry) => Ok(()),
         Err(error) => Err(platform(error)),
