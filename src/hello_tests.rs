@@ -319,3 +319,25 @@ fn discard_times_out_at_a_held_metadata_lease_and_a_later_discard_resumes() {
     assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
     assert!(refused_with(entry.get_secret(), &SealError::Discarded));
 }
+
+#[cfg(feature = "search")]
+#[test]
+fn hello_search_lists_entries_of_this_store_only() {
+    let mut scope = Scope::new("search");
+    let sealed = SealedStore::new(&scope.application, "search").unwrap();
+    scope.store.install_test_key([81; 32]);
+    let entry = scope.entry("user");
+    entry.set_secret(b"hello").unwrap();
+    assert!(
+        sealed
+            .search(&std::collections::HashMap::new())
+            .unwrap()
+            .is_empty()
+    );
+    let found = scope
+        .store
+        .search(&std::collections::HashMap::new())
+        .unwrap();
+    assert_eq!(found.len(), 1);
+    assert_eq!(found[0].get_secret().unwrap(), b"hello");
+}

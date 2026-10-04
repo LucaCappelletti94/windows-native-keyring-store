@@ -72,6 +72,10 @@ have its own conventions for delimiters used when forming the `target_name`.
 Thus, a search in one store may return a wrapper/specifier for an existing credential
 but that same search in another store may return a wrapper that is *not* a specifier.
 
+A [SealedStore] or [HelloStore] searches only its own entries, matching the optional
+`pattern` against each entry's `{user}.{service}` name rather than its scoped target.
+Search needs no key, and the entries it returns read and write as if built by the store.
+
 ## Sealed stores
 
 Credential Manager entries are readable by any process running as the user.

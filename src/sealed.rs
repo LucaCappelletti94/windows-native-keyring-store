@@ -659,6 +659,46 @@ impl Gate {
             removed
         })
     }
+
+    /// Entries of this store whose `{user}.{service}` name matches the optional `pattern`.
+    #[cfg(feature = "search")]
+    pub(crate) fn search(self: &Arc<Self>, spec: &HashMap<&str, &str>) -> Result<Vec<Entry>> {
+        let spec = parse_attributes(&["pattern"], Some(spec))?;
+        let pattern = spec
+            .get("pattern")
+            .map(|pattern| {
+                regex::Regex::new(pattern).map_err(|_| {
+                    Error::Invalid(
+                        pattern.to_string(),
+                        "is not a valid regular expression".into(),
+                    )
+                })
+            })
+            .transpose()?;
+        let names = regex::Regex::new(r"^(.*)\.(.*)$").expect("the name pattern is valid");
+        self.guarded(|| {
+            let mut entries = Vec::new();
+            for target_name in self.scoped_targets()? {
+                let legacy = self.legacy_target(&target_name)?;
+                if pattern
+                    .as_ref()
+                    .is_some_and(|pattern| !pattern.is_match(&legacy))
+                {
+                    continue;
+                }
+                let specifiers = names
+                    .captures(&legacy)
+                    .map(|captures| (captures[2].to_owned(), captures[1].to_owned()));
+                entries.push(Entry::new_with_credential(Arc::new(Cred {
+                    target_name,
+                    specifiers,
+                    persistence: CredPersist::Local,
+                    sealed: Some(Arc::clone(self)),
+                })));
+            }
+            Ok(entries)
+        })
+    }
 }
 
 /// A legacy source's content as read before and after sealing, to detect a concurrent writer.
