@@ -33,6 +33,8 @@ fn refused_with<T>(result: keyring_core::Result<T>, expected: &SealError) -> boo
 /// A Hello store with a fresh name whose records are deleted when the test ends.
 struct Scope {
     application: String,
+    // Unique per scope, so migration only ever meets plain entries this scope wrote.
+    service: String,
     store: Arc<HelloStore>,
     targets: Vec<String>,
 }
@@ -42,13 +44,14 @@ impl Scope {
         let application = format!("hello-test-{}", fastrand::u64(..));
         Self {
             store: HelloStore::new(&application, name).unwrap(),
+            service: format!("{application}-service"),
             application,
             targets: Vec::new(),
         }
     }
 
     fn entry(&mut self, user: &str) -> Entry {
-        let entry = self.store.build("service", user, None).unwrap();
+        let entry = self.store.build(&self.service, user, None).unwrap();
         self.targets.push(target_of(&entry));
         entry
     }
@@ -241,7 +244,7 @@ fn discard_retires_old_handles_and_preserves_another_named_store() {
 
     let fresh = HelloStore::new(&first.application, "first").unwrap();
     fresh.install_test_key([17; 32]);
-    let replacement = fresh.build("service", "item", None).unwrap();
+    let replacement = fresh.build(&first.service, "item", None).unwrap();
     replacement.set_secret(b"replacement").unwrap();
     assert_eq!(replacement.get_secret().unwrap(), b"replacement");
 }
@@ -301,7 +304,10 @@ fn discard_times_out_at_a_held_metadata_lease_and_a_later_discard_resumes() {
 
     let timed_out = scope.store.discard(Duration::from_millis(300));
     let other = HelloStore::new(&scope.application, "lease").unwrap();
-    let refused = other.build("service", "item", None).unwrap().get_secret();
+    let refused = other
+        .build(&scope.service, "item", None)
+        .unwrap()
+        .get_secret();
     let preserved = raw(&target_of(&entry));
     release.send(()).unwrap();
     holder.join().unwrap();

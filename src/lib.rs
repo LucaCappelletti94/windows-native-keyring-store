@@ -82,9 +82,11 @@ the application supplies, binding it to its store and target:
 use keyring_core::api::CredentialStoreApi;
 use windows_native_keyring_store::SealedStore;
 
-let store = SealedStore::new("example-app", "tokens")?;
+let service = "example-app";
+# let service = &format!("example-app-{}", std::process::id());
+let store = SealedStore::new(service, "tokens")?;
 store.unlock(&[7; 32])?;
-let entry = store.build("example-app", "alice", None)?;
+let entry = store.build(service, "alice", None)?;
 entry.set_password("refresh-token")?;
 assert_eq!(entry.get_password()?, "refresh-token");
 store.lock();
@@ -99,6 +101,15 @@ The first unlock of an empty store writes a key record, and later unlocks with a
 other key fail with [SealError::WrongKey]. Reads and writes fail with
 `NoStorageAccess` while the store is locked, and deleting an entry needs no key.
 A plain [Store] refuses to read a sealed secret as a password.
+
+An entry that a default [Store] already holds under `{user}.{service}` is migrated on
+first access after unlock, and deleting a sealed entry also deletes that plain entry.
+The plain entry is deleted only after its sealed copy is written and checked, and a
+pending-migration record makes every later access finish an interrupted migration before
+returning a secret. A plain entry that changes during migration rolls back the sealed copy
+with [SealError::Conflict], and the next access migrates its new value. Windows has no
+compare-and-delete for credentials, so stop every other writer of the plain entry while it
+migrates, or a write racing the final deletion can be lost.
 
 [SealedStore::discard] deletes a store's entries and key record without its key,
 and every existing handle of that store then fails with [SealError::Discarded].

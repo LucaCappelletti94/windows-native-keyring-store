@@ -26,6 +26,8 @@ fn write_raw(target: &str, bytes: &[u8]) {
 struct Scope {
     application: String,
     name: String,
+    // Unique per scope, so migration only ever meets plain entries this scope wrote.
+    service: String,
     store: Arc<SealedStore>,
     targets: Vec<String>,
 }
@@ -38,6 +40,7 @@ impl Scope {
     fn named(application: String, name: &str) -> Self {
         Self {
             store: SealedStore::new(&application, name).unwrap(),
+            service: format!("{application}-service"),
             application,
             name: name.into(),
             targets: Vec::new(),
@@ -53,8 +56,9 @@ impl Scope {
     }
 
     fn entry(&mut self, user: &str) -> Entry {
-        let entry = self.store.build("service", user, None).unwrap();
+        let entry = self.store.build(&self.service, user, None).unwrap();
         self.targets.push(target_of(&entry));
+        self.targets.push(self.marker(&entry));
         entry
     }
 
@@ -64,6 +68,14 @@ impl Scope {
 
     fn control(&self) -> String {
         format!("{}control", self.store.id())
+    }
+
+    /// The pending-migration marker of a scoped `entry`.
+    fn marker(&self, entry: &Entry) -> String {
+        let prefix = self.store.id();
+        let target = target_of(entry);
+        let encoded = &target[prefix.len() + "entry:".len()..];
+        format!("{prefix}migration:{encoded}")
     }
 }
 
@@ -76,6 +88,16 @@ impl Drop for Scope {
         {
             let _ = delete_credential(target);
         }
+    }
+}
+
+/// The `SealError` behind a keyring error, wherever the mapping boxed it.
+fn cause<T>(result: keyring_core::Result<T>) -> Option<SealError> {
+    match result {
+        Err(Error::NoStorageAccess(reason) | Error::PlatformFailure(reason)) => {
+            reason.downcast_ref::<SealError>().cloned()
+        }
+        _ => None,
     }
 }
 
@@ -172,7 +194,7 @@ fn wrong_key_leaves_the_store_locked_and_writes_nothing() {
     assert_eq!(raw(&scope.keycheck()).unwrap(), keycheck_before);
 
     other.unlock(&[5; 32]).unwrap();
-    let reopened = other.build("service", "user", None).unwrap();
+    let reopened = other.build(&scope.service, "user", None).unwrap();
     assert_eq!(reopened.get_secret().unwrap(), b"sealed");
 }
 
@@ -316,6 +338,7 @@ fn seal_errors_map_to_keyring_error_kinds() {
     for error in [
         SealError::Platform("service".into()),
         SealError::Conflict("authenticators".into()),
+        SealError::IncompleteDeletion("scoped".into()),
     ] {
         assert!(matches!(Error::from(error), Error::PlatformFailure(_)));
     }
@@ -423,7 +446,7 @@ fn discard_retires_every_handle_and_spares_a_sibling_store() {
     kept.set_secret(b"kept").unwrap();
     let second = scope.reopen();
     second.unlock(&[21; 32]).unwrap();
-    let second_entry = second.build("service", "user", None).unwrap();
+    let second_entry = second.build(&scope.service, "user", None).unwrap();
 
     scope.store.discard(DISCARD_TIMEOUT).unwrap();
 
@@ -448,7 +471,7 @@ fn discard_retires_every_handle_and_spares_a_sibling_store() {
 
     let fresh = scope.reopen();
     fresh.unlock(&[22; 32]).unwrap();
-    let reborn = fresh.build("service", "user", None).unwrap();
+    let reborn = fresh.build(&scope.service, "user", None).unwrap();
     assert!(matches!(reborn.get_secret(), Err(Error::NoEntry)));
     reborn.set_secret(b"second generation").unwrap();
 
@@ -530,7 +553,7 @@ fn a_deleted_control_record_never_revives_a_retired_generation() {
     scope.store.discard(DISCARD_TIMEOUT).unwrap();
     let current = scope.reopen();
     current.unlock(&[27; 32]).unwrap();
-    let entry = current.build("service", "user", None).unwrap();
+    let entry = current.build(&scope.service, "user", None).unwrap();
     scope.targets.push(target_of(&entry));
     delete_credential(&scope.control()).unwrap();
 
@@ -581,7 +604,7 @@ fn overlapping_discarders_never_delete_the_next_generation() {
 
     let next = scope.reopen();
     next.unlock(&[42; 32]).unwrap();
-    let written = next.build("service", "user", None).unwrap();
+    let written = next.build(&scope.service, "user", None).unwrap();
     written.set_secret(b"next generation").unwrap();
 
     let deadline = Instant::now() + pause::BOUND;
@@ -600,4 +623,333 @@ fn overlapping_discarders_never_delete_the_next_generation() {
     assert_eq!(written.get_secret().unwrap(), b"next generation");
     assert!(raw(&scope.keycheck()).is_ok());
     assert_eq!(second, ("second", Err(SealError::Discarded)));
+}
+
+/// The plain `Store` entry whose target a sealed entry for `user` migrates from.
+fn legacy_entry(scope: &mut Scope, user: &str) -> Entry {
+    let entry = Store::new()
+        .unwrap()
+        .build(&scope.service, user, None)
+        .unwrap();
+    scope.targets.push(target_of(&entry));
+    entry
+}
+
+#[test]
+fn migration_seals_the_exact_legacy_secret_and_removes_the_source() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "user");
+    legacy.set_password("refresh-token").unwrap();
+    legacy
+        .update_attributes(&HashMap::from([("comment", "kept")]))
+        .unwrap();
+    scope.store.unlock(&[61; 32]).unwrap();
+    let entry = scope.entry("user");
+
+    assert_eq!(entry.get_password().unwrap(), "refresh-token");
+    assert!(matches!(legacy.get_password(), Err(Error::NoEntry)));
+    assert_eq!(entry.get_attributes().unwrap()["comment"], "kept");
+    let stored = raw(&target_of(&entry)).unwrap();
+    assert!(crate::sealed_crypto::is_protected(&stored));
+    scope.store.lock();
+    assert!(refused_with(entry.get_password(), &SealError::Locked));
+    assert!(matches!(legacy.get_password(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn migration_accepts_an_arbitrary_binary_legacy_secret() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "binary");
+    let secret = [0xFF, 0xFF, 0x01, 0x02, 0x00];
+    legacy.set_secret(&secret).unwrap();
+    scope.store.unlock(&[62; 32]).unwrap();
+    let entry = scope.entry("binary");
+    assert!(matches!(
+        entry.get_password(),
+        Err(Error::BadStoreFormat(_))
+    ));
+    assert_eq!(entry.get_secret().unwrap(), secret);
+    assert!(matches!(legacy.get_secret(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_legacy_secret_too_large_to_seal_stays_where_it_was() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "large");
+    let original = vec![42; 2560];
+    legacy.set_secret(&original).unwrap();
+    scope.store.unlock(&[63; 32]).unwrap();
+    let entry = scope.entry("large");
+    assert!(matches!(entry.get_secret(), Err(Error::TooLong(_, _))));
+    assert_eq!(legacy.get_secret().unwrap(), original);
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+}
+
+#[test]
+fn writing_a_new_secret_migrates_the_legacy_source_first() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "writer");
+    legacy.set_password("old").unwrap();
+    legacy
+        .update_attributes(&HashMap::from([("comment", "from legacy")]))
+        .unwrap();
+    scope.store.unlock(&[64; 32]).unwrap();
+    let entry = scope.entry("writer");
+    entry.set_password("new").unwrap();
+    assert_eq!(entry.get_password().unwrap(), "new");
+    assert_eq!(entry.get_attributes().unwrap()["comment"], "from legacy");
+    assert!(matches!(legacy.get_password(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_corrupt_scoped_record_never_falls_back_to_the_legacy_source() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "corrupt");
+    legacy.set_password("legacy").unwrap();
+    scope.store.unlock(&[65; 32]).unwrap();
+    let entry = scope.entry("corrupt");
+    write_raw(&target_of(&entry), b"planted");
+    assert!(matches!(
+        entry.get_password(),
+        Err(Error::BadStoreFormat(_))
+    ));
+    assert_eq!(legacy.get_password().unwrap(), "legacy");
+}
+
+#[test]
+fn locked_delete_removes_both_exact_sources_without_the_key() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[66; 32]).unwrap();
+    let entry = scope.entry("both");
+    entry.set_secret(b"sealed").unwrap();
+    scope.store.lock();
+    let legacy = legacy_entry(&mut scope, "both");
+    legacy.set_secret(b"independent").unwrap();
+
+    entry.delete_credential().unwrap();
+    assert!(matches!(legacy.get_secret(), Err(Error::NoEntry)));
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    assert!(matches!(entry.delete_credential(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn deleting_an_unmigrated_entry_removes_its_legacy_source() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "unmigrated");
+    legacy.set_secret(b"legacy").unwrap();
+    let entry = scope.entry("unmigrated");
+    entry.delete_credential().unwrap();
+    assert!(matches!(legacy.get_secret(), Err(Error::NoEntry)));
+    scope.store.unlock(&[67; 32]).unwrap();
+    assert!(matches!(entry.get_secret(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn fixture_targets_are_unique_to_their_scope() {
+    let mut first = Scope::new();
+    let mut second = Scope::new();
+    let first_plain = target_of(&legacy_entry(&mut first, "user"));
+    assert_ne!(first_plain, target_of(&legacy_entry(&mut second, "user")));
+}
+
+/// Reads `user`'s password through the store on a named thread.
+fn spawn_read(scope: &Scope, user: &str) -> std::thread::JoinHandle<keyring_core::Result<String>> {
+    let store = Arc::clone(&scope.store);
+    let (service, user) = (scope.service.clone(), user.to_owned());
+    std::thread::Builder::new()
+        .name("reader".into())
+        .spawn(move || store.build(&service, &user, None)?.get_password())
+        .unwrap()
+}
+
+/// A scope whose `user` entry has an unmigrated plain source holding `original`.
+fn pending_migration(seed: u8) -> (Scope, Entry, Entry) {
+    let mut scope = Scope::new();
+    let plain = legacy_entry(&mut scope, "user");
+    plain.set_password("original").unwrap();
+    scope.store.unlock(&[seed; 32]).unwrap();
+    let entry = scope.entry("user");
+    (scope, entry, plain)
+}
+
+#[test]
+fn an_interrupted_migration_resumes_and_removes_the_plain_entry() {
+    let (scope, entry, plain) = pending_migration(81);
+    let sealed = pause::arm(&scope.store.id(), "migrate.sealed");
+    let reader = spawn_read(&scope, "user");
+    sealed.next().panic();
+    assert!(reader.join().is_err());
+    drop(sealed);
+    assert_eq!(entry.get_password().unwrap(), "original");
+    assert!(matches!(plain.get_password(), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.marker(&entry)), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_migration_stopped_before_its_sealed_copy_restarts_from_the_plain_entry() {
+    let (scope, entry, plain) = pending_migration(82);
+    let marked = pause::arm(&scope.store.id(), "migrate.marked");
+    let reader = spawn_read(&scope, "user");
+    marked.next().panic();
+    assert!(reader.join().is_err());
+    drop(marked);
+    assert_eq!(entry.get_password().unwrap(), "original");
+    assert!(matches!(plain.get_password(), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.marker(&entry)), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_failed_plain_deletion_is_retried_before_any_sealed_read() {
+    let (scope, entry, plain) = pending_migration(83);
+    let delete = pause::arm(&scope.store.id(), "migrate.delete-plain");
+    let reader = spawn_read(&scope, "user");
+    delete
+        .next()
+        .fail(SealError::Platform("injected deletion failure".into()));
+    let first = reader.join().unwrap();
+    assert_eq!(
+        cause(first),
+        Some(SealError::Platform("injected deletion failure".into()))
+    );
+    assert_eq!(plain.get_password().unwrap(), "original");
+    drop(delete);
+    assert_eq!(entry.get_password().unwrap(), "original");
+    assert!(matches!(plain.get_password(), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.marker(&entry)), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_plain_entry_changed_during_migration_is_rolled_back_and_migrated_again() {
+    let (scope, entry, plain) = pending_migration(84);
+    let sealed = pause::arm(&scope.store.id(), "migrate.sealed");
+    let reader = spawn_read(&scope, "user");
+    let arrival = sealed.next();
+    plain.set_password("changed").unwrap();
+    arrival.resume();
+    assert!(matches!(
+        cause(reader.join().unwrap()),
+        Some(SealError::Conflict(_))
+    ));
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.marker(&entry)), Err(Error::NoEntry)));
+    drop(sealed);
+    assert_eq!(entry.get_password().unwrap(), "changed");
+    assert!(matches!(plain.get_password(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_failed_rollback_is_reported_and_the_next_access_migrates_again() {
+    let (scope, entry, plain) = pending_migration(85);
+    let prefix = scope.store.id();
+    let sealed = pause::arm(&prefix, "migrate.sealed");
+    let rollback = pause::arm(&prefix, "migrate.rollback");
+    let reader = spawn_read(&scope, "user");
+    let arrival = sealed.next();
+    plain.set_password("changed").unwrap();
+    arrival.resume();
+    rollback
+        .next()
+        .fail(SealError::Platform("injected rollback failure".into()));
+    assert_eq!(
+        cause(reader.join().unwrap()),
+        Some(SealError::Platform("injected rollback failure".into()))
+    );
+    assert!(raw(&target_of(&entry)).is_ok());
+    assert!(raw(&scope.marker(&entry)).is_ok());
+    drop((sealed, rollback));
+    assert_eq!(entry.get_password().unwrap(), "changed");
+    assert!(matches!(plain.get_password(), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.marker(&entry)), Err(Error::NoEntry)));
+}
+
+/// Leaves `entry` with its plain source, sealed copy and marker all present.
+fn interrupt_after_sealing(scope: &Scope) {
+    let sealed = pause::arm(&scope.store.id(), "migrate.sealed");
+    let reader = spawn_read(scope, "user");
+    sealed.next().panic();
+    assert!(reader.join().is_err());
+}
+
+#[test]
+fn deleting_a_pending_migration_removes_every_record() {
+    let (scope, entry, plain) = pending_migration(86);
+    interrupt_after_sealing(&scope);
+    scope.store.lock();
+    entry.delete_credential().unwrap();
+    for removed in [target_of(&entry), scope.marker(&entry), target_of(&plain)] {
+        assert!(matches!(raw(&removed), Err(Error::NoEntry)), "{removed}");
+    }
+    scope.store.unlock(&[86; 32]).unwrap();
+    assert!(matches!(entry.get_password(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn discard_removes_pending_migration_markers() {
+    let (scope, entry, _plain) = pending_migration(87);
+    interrupt_after_sealing(&scope);
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+    assert!(matches!(raw(&scope.marker(&entry)), Err(Error::NoEntry)));
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_plain_entry_written_after_migration_stays_independent() {
+    let (_scope, entry, plain) = pending_migration(88);
+    assert_eq!(entry.get_password().unwrap(), "original");
+    plain.set_password("independent").unwrap();
+    assert_eq!(entry.get_password().unwrap(), "original");
+    assert_eq!(plain.get_password().unwrap(), "independent");
+}
+
+#[test]
+fn a_plain_entry_whose_attributes_change_during_migration_conflicts() {
+    let (scope, entry, plain) = pending_migration(89);
+    let sealed = pause::arm(&scope.store.id(), "migrate.sealed");
+    let reader = spawn_read(&scope, "user");
+    let arrival = sealed.next();
+    plain
+        .update_attributes(&HashMap::from([("comment", "changed")]))
+        .unwrap();
+    arrival.resume();
+    assert!(matches!(
+        cause(reader.join().unwrap()),
+        Some(SealError::Conflict(_))
+    ));
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    drop(sealed);
+    assert_eq!(entry.get_password().unwrap(), "original");
+    assert_eq!(entry.get_attributes().unwrap()["comment"], "changed");
+    assert!(matches!(plain.get_password(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_resumed_migration_takes_attributes_changed_since_the_interruption() {
+    let (scope, entry, plain) = pending_migration(90);
+    interrupt_after_sealing(&scope);
+    plain
+        .update_attributes(&HashMap::from([("comment", "changed")]))
+        .unwrap();
+    assert_eq!(entry.get_password().unwrap(), "original");
+    assert_eq!(entry.get_attributes().unwrap()["comment"], "changed");
+    assert!(matches!(plain.get_password(), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.marker(&entry)), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_resumed_migration_takes_every_attribute_changed_since_the_interruption() {
+    let (scope, entry, plain) = pending_migration(91);
+    interrupt_after_sealing(&scope);
+    let changed = HashMap::from([
+        ("username", "new-user"),
+        ("target_alias", "new-alias"),
+        ("comment", "new-comment"),
+    ]);
+    plain.update_attributes(&changed).unwrap();
+    assert_eq!(entry.get_password().unwrap(), "original");
+    let attributes = entry.get_attributes().unwrap();
+    for (name, value) in changed {
+        assert_eq!(attributes[name], value, "{name}");
+    }
+    assert!(matches!(plain.get_password(), Err(Error::NoEntry)));
+    assert!(matches!(raw(&scope.marker(&entry)), Err(Error::NoEntry)));
 }
