@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use keyring_core::attributes::parse_attributes;
 use keyring_core::{Entry, Error, Result};
 use windows_sys::Win32::Security::Credentials::{
-    CRED_MAX_CREDENTIAL_BLOB_SIZE, CredEnumerateW, CredFree,
+    CRED_MAX_CREDENTIAL_BLOB_SIZE, CREDENTIALW, CredEnumerateW, CredFree,
 };
 use zeroize::Zeroizing;
 
@@ -59,6 +59,9 @@ pub enum SealError {
     /// The store's Windows Hello passkey is gone or no longer matches its entries.
     #[error("Windows Hello credential for this store was lost")]
     KeyLost,
+    /// The legacy source was deleted but the scoped record was not.
+    #[error("legacy source deleted but scoped deletion failed ({0})")]
+    IncompleteDeletion(String),
 }
 
 impl From<SealError> for Error {
@@ -66,7 +69,7 @@ impl From<SealError> for Error {
         match error {
             SealError::Corrupt(reason) => Error::BadStoreFormat(reason),
             SealError::Unsupported(reason) => Error::NotSupportedByStore(reason),
-            SealError::Platform(_) | SealError::Conflict(_) => {
+            SealError::Platform(_) | SealError::Conflict(_) | SealError::IncompleteDeletion(_) => {
                 Error::PlatformFailure(Box::new(error))
             }
             _ => Error::NoStorageAccess(Box::new(error)),
@@ -94,6 +97,7 @@ pub enum Protection {
 
 const MAX_PROTECTED_PLAINTEXT: usize = CRED_MAX_CREDENTIAL_BLOB_SIZE as usize - PROTECTED_OVERHEAD;
 pub(crate) const CONTROL_MAGIC: &[u8; 5] = b"SCTL1";
+const MIGRATION_PENDING: &[u8; 5] = b"SMIG1";
 
 /// The store's discard state, which retires every handle that saw another generation.
 #[derive(Clone, Copy)]
@@ -230,6 +234,7 @@ impl Gate {
         let folded = FoldedName::new(spelling)?;
         let target = format!("{}entry:{}", self.prefix, hex(folded.as_str().as_bytes()));
         validate_target(&target, "")?;
+        validate_target(&self.marker_target(&target)?, "")?;
         Ok(target)
     }
 
@@ -352,9 +357,13 @@ impl Gate {
         self.publish_generation()
     }
 
-    /// Deletes every scoped entry, then the keycheck record.
+    /// Deletes every scoped entry and pending-migration marker, then the keycheck record.
     pub(crate) fn delete_entries(&self) -> SealResult<()> {
-        for target in self.scoped_targets()? {
+        for target in self
+            .targets_under("entry:")?
+            .into_iter()
+            .chain(self.targets_under("migration:")?)
+        {
             delete_owned(&target)?;
         }
         delete_owned(&self.keycheck_target())
@@ -412,8 +421,13 @@ impl Gate {
     }
 
     fn scoped_targets(&self) -> SealResult<Vec<String>> {
-        let entry_prefix = format!("{}entry:", self.prefix);
-        let filter: Vec<u16> = format!("{entry_prefix}*\0").encode_utf16().collect();
+        self.targets_under("entry:")
+    }
+
+    /// Every target of this store that starts with `kind` after the store prefix.
+    fn targets_under(&self, kind: &str) -> SealResult<Vec<String>> {
+        let kind_prefix = format!("{}{kind}", self.prefix);
+        let filter: Vec<u16> = format!("{kind_prefix}*\0").encode_utf16().collect();
         let mut count = 0;
         let mut entries = std::ptr::null_mut();
         // SAFETY: `filter` is NUL-terminated and both out pointers are writable locals.
@@ -445,7 +459,7 @@ impl Gate {
             .map(|target| {
                 let folded = FoldedName::new(&target).map_err(platform)?;
                 let canonical = folded.as_str().to_ascii_lowercase();
-                if folded.as_str().is_ascii() && canonical.starts_with(&entry_prefix) {
+                if folded.as_str().is_ascii() && canonical.starts_with(&kind_prefix) {
                     Ok(canonical)
                 } else {
                     Err(SealError::Corrupt(
@@ -481,8 +495,127 @@ impl Gate {
         Ok(open(key, &self.prefix, target, &blob)?)
     }
 
-    pub(crate) fn get_secret(&self, target: &str) -> Result<Vec<u8>> {
-        self.with_key(|key| Ok(std::mem::take(&mut *self.open_scoped(target, key)?)))
+    /// The hex-encoded plain target that the scoped `target` was derived from.
+    fn encoded_legacy<'a>(&self, target: &'a str) -> Result<&'a str> {
+        target
+            .strip_prefix(&self.prefix)
+            .and_then(|suffix| suffix.strip_prefix("entry:"))
+            .ok_or_else(|| Error::BadStoreFormat("entry escaped its scoped prefix".into()))
+    }
+
+    /// The plain `Store` target, in the folded case, that the scoped `target` was derived from.
+    fn legacy_target(&self, target: &str) -> Result<String> {
+        Ok(decode_hex(self.encoded_legacy(target)?)?)
+    }
+
+    /// The record whose presence marks the migration into `target` as unfinished.
+    fn marker_target(&self, target: &str) -> Result<String> {
+        Ok(format!(
+            "{}migration:{}",
+            self.prefix,
+            self.encoded_legacy(target)?
+        ))
+    }
+
+    /// Opens the scoped secret, first finishing or starting the migration of its plain source.
+    fn migrate(&self, target: &str, spelling: &str, key: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
+        let legacy = &self.legacy_target(target)?;
+        let marker = &self.marker_target(target)?;
+        // Stores sharing a service and user share this legacy source, and its folded name gives
+        // every spelling Credential Manager matches the same lock.
+        let _source = lock_target(legacy)?;
+        let pending = read_raw(marker)?.is_some();
+        let sealed = match self.open_scoped(target, key) {
+            Ok(secret) if !pending => return Ok(secret),
+            Ok(secret) => Some(secret),
+            Err(Error::NoEntry) => None,
+            Err(error) => return Err(error),
+        };
+        let current = match snapshot(legacy) {
+            Ok(current) => current,
+            // Without a plain source the sealed copy, if any, is the whole entry.
+            Err(Error::NoEntry) => {
+                delete_owned(marker)?;
+                return sealed.ok_or(Error::NoEntry);
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(secret) = sealed {
+            let stored = extract_from_credential(target, extract_attributes)?;
+            if *secret == *current.source && same_fields(&stored, &current.attributes) {
+                self.finish_migration(target, legacy, marker)?;
+                return Ok(secret);
+            }
+        }
+        // While `marker` exists the sealed copy holds only migration snapshots, so `current` wins.
+        self.migrate_from(target, spelling, key, legacy, marker, current)
+    }
+
+    /// Seals `taken` from the plain source into `target`, then deletes the source.
+    fn migrate_from(
+        &self,
+        target: &str,
+        spelling: &str,
+        key: &[u8; 32],
+        legacy: &str,
+        marker: &str,
+        taken: Snapshot,
+    ) -> Result<Zeroizing<Vec<u8>>> {
+        let Snapshot { source, attributes } = taken;
+        validate_protected_plaintext(&source)?;
+        let sealed = seal(key, &self.prefix, target, &source)?;
+        validate_secret(&sealed)?;
+        save_credential(marker, "", "", "", MIGRATION_PENDING, &CredPersist::Local)?;
+        #[cfg(test)]
+        crate::pause::reached(&self.prefix, "migrate.marked")?;
+        save_spelled_credential(
+            target,
+            &attributes["username"],
+            &attributes["target_alias"],
+            &attributes["comment"],
+            &sealed,
+            spelling,
+        )?;
+        #[cfg(test)]
+        crate::pause::reached(&self.prefix, "migrate.sealed")?;
+        // Content decides, since deleting a plain entry rewritten with the same data loses nothing.
+        let unchanged = match snapshot(legacy) {
+            Ok(current) => current.source == source && current.attributes == attributes,
+            Err(Error::NoEntry) => false,
+            Err(error) => return Err(error),
+        };
+        if !unchanged {
+            return self.roll_back(target, legacy, marker);
+        }
+        self.finish_migration(target, legacy, marker)?;
+        Ok(source)
+    }
+
+    /// Deletes the plain source, then the marker, so the migration counts as complete.
+    fn finish_migration(&self, target: &str, legacy: &str, marker: &str) -> Result<()> {
+        #[cfg(test)]
+        crate::pause::reached(&self.prefix, "migrate.delete-plain")?;
+        match delete_credential(legacy) {
+            Ok(()) => {}
+            // A plain source deleted by someone else takes its sealed copy with it.
+            Err(Error::NoEntry) => return self.roll_back(target, legacy, marker),
+            Err(error) => return Err(error),
+        }
+        delete_owned(marker)?;
+        Ok(())
+    }
+
+    /// Removes the sealed copy this migration wrote, then the marker, and reports the conflict.
+    fn roll_back<T>(&self, target: &str, legacy: &str, marker: &str) -> Result<T> {
+        #[cfg(test)]
+        crate::pause::reached(&self.prefix, "migrate.rollback")?;
+        delete_owned(target)?;
+        delete_owned(marker)?;
+        Err(SealError::Conflict(legacy.into()).into())
+    }
+
+    pub(crate) fn get_secret(&self, target: &str, spelling: &str) -> Result<Vec<u8>> {
+        self.with_key(|key| Ok(std::mem::take(&mut *self.migrate(target, spelling, key)?)))
     }
 
     pub(crate) fn set_secret(
@@ -495,7 +628,7 @@ impl Gate {
         validate_protected_plaintext(secret)?;
         self.with_key(|key| {
             // A record that does not open is kept for inspection, never overwritten.
-            let attributes = match self.open_scoped(target, key) {
+            let attributes = match self.migrate(target, spelling, key) {
                 Ok(_) => Some(extract_from_credential(target, extract_attributes)?),
                 Err(Error::NoEntry) => None,
                 Err(error) => return Err(error),
@@ -528,23 +661,90 @@ impl Gate {
     ) -> Result<()> {
         validate_attributes(user, alias, comment)?;
         self.with_key(|key| {
-            let secret = self.open_scoped(target, key)?;
+            let secret = self.migrate(target, spelling, key)?;
             let sealed = seal(key, &self.prefix, target, &secret)?;
             save_spelled_credential(target, user, alias, comment, &sealed, spelling)
         })
     }
 
-    pub(crate) fn attributes(&self, target: &str) -> Result<HashMap<String, String>> {
+    pub(crate) fn attributes(
+        &self,
+        target: &str,
+        spelling: &str,
+    ) -> Result<HashMap<String, String>> {
         self.with_key(|key| {
-            self.open_scoped(target, key)?;
+            self.migrate(target, spelling, key)?;
             extract_from_credential(target, extract_attributes)
         })
     }
 
-    /// Deletes the entry without its key, so a locked store can still remove it.
+    /// Deletes the entry, its exact legacy source and any pending migration, without the key.
     pub(crate) fn delete(&self, target: &str) -> Result<()> {
-        self.guarded(|| delete_credential(target))
+        let legacy = &self.legacy_target(target)?;
+        let marker = &self.marker_target(target)?;
+        self.guarded(|| {
+            let _source = lock_target(legacy)?;
+            let legacy_deleted = match delete_credential(legacy) {
+                Ok(()) => true,
+                Err(Error::NoEntry) => false,
+                Err(error) => return Err(error),
+            };
+            let removed = match delete_credential(target) {
+                Err(Error::NoEntry) if legacy_deleted => Ok(()),
+                Err(error) if legacy_deleted => {
+                    Err(SealError::IncompleteDeletion(error.to_string()).into())
+                }
+                result => result,
+            };
+            if matches!(removed, Ok(()) | Err(Error::NoEntry)) {
+                delete_owned(marker)?;
+            }
+            removed
+        })
     }
+}
+
+/// A legacy source's content as read before and after sealing, to detect a concurrent writer.
+struct Snapshot {
+    source: Zeroizing<Vec<u8>>,
+    attributes: HashMap<String, String>,
+}
+
+fn snapshot(target: &str) -> Result<Snapshot> {
+    extract_from_credential(target, |native: &CREDENTIALW| {
+        Ok(Snapshot {
+            source: Zeroizing::new(extract_secret(native)?),
+            attributes: extract_attributes(native)?,
+        })
+    })
+}
+
+/// Whether two credentials carry the same attributes a migration copies.
+fn same_fields(left: &HashMap<String, String>, right: &HashMap<String, String>) -> bool {
+    ["username", "target_alias", "comment"]
+        .iter()
+        .all(|name| left.get(*name) == right.get(*name))
+}
+
+fn decode_hex(encoded: &str) -> SealResult<String> {
+    fn digit(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            _ => None,
+        }
+    }
+    let invalid = || SealError::Corrupt("invalid scoped target encoding".into());
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(invalid());
+    }
+    let decoded = pairs
+        .iter()
+        .map(|&[high, low]| Some(digit(high)? << 4 | digit(low)?))
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(invalid)?;
+    String::from_utf8(decoded).map_err(|_| SealError::Corrupt("invalid scoped target UTF-8".into()))
 }
 
 pub(crate) fn read_raw(target: &str) -> SealResult<Option<Zeroizing<Vec<u8>>>> {

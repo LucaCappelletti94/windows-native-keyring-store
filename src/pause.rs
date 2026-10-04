@@ -12,6 +12,8 @@ pub(crate) const BOUND: Duration = Duration::from_secs(30);
 
 enum Answer {
     Resume,
+    Fail(SealError),
+    Panic,
 }
 
 /// One thread stopped at an armed point, released exactly once and resumed if dropped.
@@ -23,6 +25,16 @@ pub(crate) struct Arrival {
 impl Arrival {
     pub(crate) fn resume(mut self) {
         self.answer(Answer::Resume);
+    }
+
+    /// Makes the paused call return `error` at this point.
+    pub(crate) fn fail(mut self, error: SealError) {
+        self.answer(Answer::Fail(error));
+    }
+
+    /// Unwinds the paused thread, standing in for a process that stops at this point.
+    pub(crate) fn panic(mut self) {
+        self.answer(Answer::Panic);
     }
 
     fn answer(&mut self, answer: Answer) {
@@ -100,6 +112,8 @@ pub(crate) fn reached(prefix: &str, point: &'static str) -> Result<(), SealError
     }
     match answer.recv_timeout(BOUND) {
         Ok(Answer::Resume) | Err(RecvTimeoutError::Disconnected) => Ok(()),
+        Ok(Answer::Fail(error)) => Err(error),
+        Ok(Answer::Panic) => panic!("stopped at pause point {point}"),
         Err(RecvTimeoutError::Timeout) => panic!("pause point {point} was never answered"),
     }
 }
