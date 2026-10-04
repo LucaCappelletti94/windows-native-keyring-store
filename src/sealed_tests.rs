@@ -632,3 +632,68 @@ fn deleting_an_unmigrated_entry_removes_its_legacy_source() {
     scope.store.unlock(&[67; 32]).unwrap();
     assert!(matches!(entry.get_secret(), Err(Error::NoEntry)));
 }
+
+#[cfg(feature = "search")]
+#[test]
+fn search_lists_only_this_stores_entries_with_their_specifiers() {
+    let mut scope = Scope::new();
+    let mut sibling = scope.sibling("other");
+    scope.store.unlock(&[71; 32]).unwrap();
+    sibling.store.unlock(&[71; 32]).unwrap();
+    scope.entry("alice").set_secret(b"a").unwrap();
+    scope.entry("bob").set_secret(b"b").unwrap();
+    sibling.entry("alice").set_secret(b"other").unwrap();
+    let plain = legacy_entry(&mut scope, "carol");
+    plain.set_secret(b"plain").unwrap();
+
+    let found = scope.store.search(&HashMap::new()).unwrap();
+    let mut users: Vec<_> = found
+        .iter()
+        .map(|entry| entry.get_specifiers().unwrap())
+        .collect();
+    users.sort();
+    assert_eq!(
+        users,
+        [
+            ("service".to_owned(), "alice".to_owned()),
+            ("service".to_owned(), "bob".to_owned())
+        ]
+    );
+    let bob = scope
+        .store
+        .search(&HashMap::from([("pattern", "^bob\\.")]))
+        .unwrap();
+    assert_eq!(bob.len(), 1);
+    assert_eq!(bob[0].get_secret().unwrap(), b"b");
+}
+
+#[cfg(feature = "search")]
+#[test]
+fn search_needs_no_key_and_refuses_bad_patterns_and_retired_handles() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[72; 32]).unwrap();
+    scope.entry("user").set_secret(b"sealed").unwrap();
+    scope.store.lock();
+    let found = scope.store.search(&HashMap::new()).unwrap();
+    assert_eq!(found.len(), 1);
+    assert!(refused_with(found[0].get_secret(), &SealError::Locked));
+    assert!(matches!(
+        scope.store.search(&HashMap::from([("pattern", "(")])),
+        Err(Error::Invalid(_, _))
+    ));
+    scope.store.discard(DISCARD_TIMEOUT).unwrap();
+    assert!(refused_with(
+        scope.store.search(&HashMap::new()),
+        &SealError::Discarded
+    ));
+}
+
+#[cfg(not(feature = "search"))]
+#[test]
+fn search_is_unsupported_without_the_search_feature() {
+    let scope = Scope::new();
+    assert!(matches!(
+        scope.store.search(&HashMap::new()),
+        Err(Error::NotSupportedByStore(_))
+    ));
+}
