@@ -100,6 +100,13 @@ other key fail with [SealError::WrongKey]. Reads and writes fail with
 `NoStorageAccess` while the store is locked, and deleting an entry needs no key.
 A plain [Store] refuses to read a sealed secret as a password.
 
+An entry that a default [Store] already holds under `{user}.{service}` is migrated on
+first access after unlock. Its secret and attributes are sealed under the scoped target
+and the plain entry is deleted, and deleting a sealed entry also deletes that plain entry.
+Stop every other writer of the plain entry while it migrates. Windows has no
+compare-and-delete for credentials, so a write racing the final deletion fails with
+[SealError::Conflict] or can be lost.
+
 [SealedStore::discard] deletes a store's entries and key record without its key,
 and every existing handle of that store then fails with [SealError::Discarded].
 Opening the store again gives an empty store whose first unlock records a new key.

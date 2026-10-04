@@ -315,6 +315,7 @@ fn seal_errors_map_to_keyring_error_kinds() {
     for error in [
         SealError::Platform("service".into()),
         SealError::Conflict("authenticators".into()),
+        SealError::IncompleteDeletion("scoped".into()),
     ] {
         assert!(matches!(Error::from(error), Error::PlatformFailure(_)));
     }
@@ -514,4 +515,120 @@ fn a_deleted_control_record_never_revives_a_retired_generation() {
 
     assert!(refused_with(entry.get_secret(), &SealError::Discarded));
     assert_eq!(current.discard(DISCARD_TIMEOUT), Err(SealError::Discarded));
+}
+
+/// The plain `Store` entry whose target a sealed entry for `user` migrates from.
+fn legacy_entry(scope: &mut Scope, user: &str) -> Entry {
+    let entry = Store::new().unwrap().build("service", user, None).unwrap();
+    scope.targets.push(target_of(&entry));
+    entry
+}
+
+#[test]
+fn migration_seals_the_exact_legacy_secret_and_removes_the_source() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "user");
+    legacy.set_password("refresh-token").unwrap();
+    legacy
+        .update_attributes(&HashMap::from([("comment", "kept")]))
+        .unwrap();
+    scope.store.unlock(&[61; 32]).unwrap();
+    let entry = scope.entry("user");
+
+    assert_eq!(entry.get_password().unwrap(), "refresh-token");
+    assert!(matches!(legacy.get_password(), Err(Error::NoEntry)));
+    assert_eq!(entry.get_attributes().unwrap()["comment"], "kept");
+    let stored = raw(&target_of(&entry)).unwrap();
+    assert!(crate::sealed_crypto::is_protected(&stored));
+    scope.store.lock();
+    assert!(refused_with(entry.get_password(), &SealError::Locked));
+    assert!(matches!(legacy.get_password(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn migration_accepts_an_arbitrary_binary_legacy_secret() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "binary");
+    let secret = [0xFF, 0xFF, 0x01, 0x02, 0x00];
+    legacy.set_secret(&secret).unwrap();
+    scope.store.unlock(&[62; 32]).unwrap();
+    let entry = scope.entry("binary");
+    assert!(matches!(
+        entry.get_password(),
+        Err(Error::BadStoreFormat(_))
+    ));
+    assert_eq!(entry.get_secret().unwrap(), secret);
+    assert!(matches!(legacy.get_secret(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_legacy_secret_too_large_to_seal_stays_where_it_was() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "large");
+    let original = vec![42; 2560];
+    legacy.set_secret(&original).unwrap();
+    scope.store.unlock(&[63; 32]).unwrap();
+    let entry = scope.entry("large");
+    assert!(matches!(entry.get_secret(), Err(Error::TooLong(_, _))));
+    assert_eq!(legacy.get_secret().unwrap(), original);
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+}
+
+#[test]
+fn writing_a_new_secret_migrates_the_legacy_source_first() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "writer");
+    legacy.set_password("old").unwrap();
+    legacy
+        .update_attributes(&HashMap::from([("comment", "from legacy")]))
+        .unwrap();
+    scope.store.unlock(&[64; 32]).unwrap();
+    let entry = scope.entry("writer");
+    entry.set_password("new").unwrap();
+    assert_eq!(entry.get_password().unwrap(), "new");
+    assert_eq!(entry.get_attributes().unwrap()["comment"], "from legacy");
+    assert!(matches!(legacy.get_password(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn a_corrupt_scoped_record_never_falls_back_to_the_legacy_source() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "corrupt");
+    legacy.set_password("legacy").unwrap();
+    scope.store.unlock(&[65; 32]).unwrap();
+    let entry = scope.entry("corrupt");
+    write_raw(&target_of(&entry), b"planted");
+    assert!(matches!(
+        entry.get_password(),
+        Err(Error::BadStoreFormat(_))
+    ));
+    assert_eq!(legacy.get_password().unwrap(), "legacy");
+}
+
+#[test]
+fn locked_delete_removes_both_exact_sources_without_the_key() {
+    let mut scope = Scope::new();
+    scope.store.unlock(&[66; 32]).unwrap();
+    let entry = scope.entry("both");
+    entry.set_secret(b"sealed").unwrap();
+    scope.store.lock();
+    let legacy = legacy_entry(&mut scope, "both");
+    legacy.set_secret(b"independent").unwrap();
+
+    entry.delete_credential().unwrap();
+    assert!(matches!(legacy.get_secret(), Err(Error::NoEntry)));
+    assert!(matches!(raw(&target_of(&entry)), Err(Error::NoEntry)));
+    assert!(matches!(entry.delete_credential(), Err(Error::NoEntry)));
+}
+
+#[test]
+fn deleting_an_unmigrated_entry_removes_its_legacy_source() {
+    let mut scope = Scope::new();
+    let legacy = legacy_entry(&mut scope, "unmigrated");
+    legacy.set_secret(b"legacy").unwrap();
+    let entry = scope.entry("unmigrated");
+    entry.delete_credential().unwrap();
+    assert!(matches!(legacy.get_secret(), Err(Error::NoEntry)));
+    scope.store.unlock(&[67; 32]).unwrap();
+    assert!(matches!(entry.get_secret(), Err(Error::NoEntry)));
 }

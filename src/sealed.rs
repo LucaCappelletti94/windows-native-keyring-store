@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use keyring_core::attributes::parse_attributes;
 use keyring_core::{Entry, Error, Result};
 use windows_sys::Win32::Security::Credentials::{
-    CRED_MAX_CREDENTIAL_BLOB_SIZE, CredEnumerateW, CredFree,
+    CRED_MAX_CREDENTIAL_BLOB_SIZE, CREDENTIALW, CredEnumerateW, CredFree,
 };
 use zeroize::Zeroizing;
 
@@ -58,6 +58,9 @@ pub enum SealError {
     /// The store's Windows Hello passkey is gone or no longer matches its entries.
     #[error("Windows Hello credential for this store was lost")]
     KeyLost,
+    /// The legacy source was deleted but the scoped record was not.
+    #[error("legacy source deleted but scoped deletion failed ({0})")]
+    IncompleteDeletion(String),
 }
 
 impl From<SealError> for Error {
@@ -65,7 +68,7 @@ impl From<SealError> for Error {
         match error {
             SealError::Corrupt(reason) => Error::BadStoreFormat(reason),
             SealError::Unsupported(reason) => Error::NotSupportedByStore(reason),
-            SealError::Platform(_) | SealError::Conflict(_) => {
+            SealError::Platform(_) | SealError::Conflict(_) | SealError::IncompleteDeletion(_) => {
                 Error::PlatformFailure(Box::new(error))
             }
             _ => Error::NoStorageAccess(Box::new(error)),
@@ -449,15 +452,67 @@ impl Gate {
         Ok(open(key, &self.prefix, target, &blob)?)
     }
 
+    /// The plain `Store` target that the scoped `target` was derived from.
+    fn legacy_target(&self, target: &str) -> Result<String> {
+        let encoded = target
+            .strip_prefix(&self.prefix)
+            .and_then(|suffix| suffix.strip_prefix("entry:"))
+            .ok_or_else(|| Error::BadStoreFormat("entry escaped its scoped prefix".into()))?;
+        Ok(decode_hex(encoded)?)
+    }
+
+    /// Opens the scoped secret, first sealing and moving its exact legacy source if absent.
+    fn migrate(&self, target: &str, key: &[u8; 32]) -> Result<Zeroizing<Vec<u8>>> {
+        let legacy = &self.legacy_target(target)?;
+        // Stores sharing a service and user also share this legacy source.
+        let _source = lock_target(legacy)?;
+        match self.open_scoped(target, key) {
+            Err(Error::NoEntry) => {}
+            opened => return opened,
+        }
+        let Snapshot {
+            source,
+            attributes,
+            modified,
+        } = snapshot(legacy)?;
+        validate_protected_plaintext(&source)?;
+        let sealed = seal(key, &self.prefix, target, &source)?;
+        validate_secret(&sealed)?;
+        save_credential(
+            target,
+            &attributes["username"],
+            &attributes["target_alias"],
+            &attributes["comment"],
+            &sealed,
+            &CredPersist::Local,
+        )?;
+        let current = match snapshot(legacy) {
+            Ok(current) => current,
+            Err(Error::NoEntry) => return Err(SealError::Conflict(legacy.into()).into()),
+            Err(error) => return Err(error),
+        };
+        if current.source != source
+            || current.attributes != attributes
+            || current.modified != modified
+        {
+            return Err(SealError::Conflict(legacy.into()).into());
+        }
+        match delete_credential(legacy) {
+            Err(Error::NoEntry) => return Err(SealError::Conflict(legacy.into()).into()),
+            result => result?,
+        }
+        Ok(source)
+    }
+
     pub(crate) fn get_secret(&self, target: &str) -> Result<Vec<u8>> {
-        self.with_key(|key| Ok(std::mem::take(&mut *self.open_scoped(target, key)?)))
+        self.with_key(|key| Ok(std::mem::take(&mut *self.migrate(target, key)?)))
     }
 
     pub(crate) fn set_secret(&self, target: &str, user: &str, secret: &[u8]) -> Result<()> {
         validate_protected_plaintext(secret)?;
         self.with_key(|key| {
             // A record that does not open is kept for inspection, never overwritten.
-            let attributes = match self.open_scoped(target, key) {
+            let attributes = match self.migrate(target, key) {
                 Ok(_) => Some(extract_from_credential(target, extract_attributes)?),
                 Err(Error::NoEntry) => None,
                 Err(error) => return Err(error),
@@ -489,7 +544,7 @@ impl Gate {
     ) -> Result<()> {
         validate_attributes(user, alias, comment)?;
         self.with_key(|key| {
-            let secret = self.open_scoped(target, key)?;
+            let secret = self.migrate(target, key)?;
             let sealed = seal(key, &self.prefix, target, &secret)?;
             save_credential(target, user, alias, comment, &sealed, &CredPersist::Local)
         })
@@ -497,15 +552,70 @@ impl Gate {
 
     pub(crate) fn attributes(&self, target: &str) -> Result<HashMap<String, String>> {
         self.with_key(|key| {
-            self.open_scoped(target, key)?;
+            self.migrate(target, key)?;
             extract_from_credential(target, extract_attributes)
         })
     }
 
-    /// Deletes the entry without its key, so a locked store can still remove it.
+    /// Deletes the entry and its exact legacy source without the key.
     pub(crate) fn delete(&self, target: &str) -> Result<()> {
-        self.guarded(|| delete_credential(target))
+        let legacy = &self.legacy_target(target)?;
+        self.guarded(|| {
+            let _source = lock_target(legacy)?;
+            let legacy_deleted = match delete_credential(legacy) {
+                Ok(()) => true,
+                Err(Error::NoEntry) => false,
+                Err(error) => return Err(error),
+            };
+            match delete_credential(target) {
+                Err(Error::NoEntry) if legacy_deleted => Ok(()),
+                Err(error) if legacy_deleted => {
+                    Err(SealError::IncompleteDeletion(error.to_string()).into())
+                }
+                result => result,
+            }
+        })
     }
+}
+
+/// A legacy source as read before and after sealing, to detect a concurrent writer.
+struct Snapshot {
+    source: Zeroizing<Vec<u8>>,
+    attributes: HashMap<String, String>,
+    modified: u64,
+}
+
+fn snapshot(target: &str) -> Result<Snapshot> {
+    extract_from_credential(target, |native: &CREDENTIALW| {
+        let modified = (u64::from(native.LastWritten.dwHighDateTime) << 32)
+            | u64::from(native.LastWritten.dwLowDateTime);
+        Ok(Snapshot {
+            source: Zeroizing::new(extract_secret(native)?),
+            attributes: extract_attributes(native)?,
+            modified,
+        })
+    })
+}
+
+fn decode_hex(encoded: &str) -> SealResult<String> {
+    fn digit(value: u8) -> Option<u8> {
+        match value {
+            b'0'..=b'9' => Some(value - b'0'),
+            b'a'..=b'f' => Some(value - b'a' + 10),
+            _ => None,
+        }
+    }
+    let invalid = || SealError::Corrupt("invalid scoped target encoding".into());
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(invalid());
+    }
+    let decoded = pairs
+        .iter()
+        .map(|&[high, low]| Some(digit(high)? << 4 | digit(low)?))
+        .collect::<Option<Vec<u8>>>()
+        .ok_or_else(invalid)?;
+    String::from_utf8(decoded).map_err(|_| SealError::Corrupt("invalid scoped target UTF-8".into()))
 }
 
 pub(crate) fn read_raw(target: &str) -> SealResult<Option<Zeroizing<Vec<u8>>>> {
